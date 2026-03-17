@@ -19,6 +19,8 @@ pub enum MessageType {
     MasterToChunkServer = 4,
     ClientToChunkServer = 5,
     ChunkServerToClient = 6,
+    ChunkServerToChunkServer = 7,
+    ChunkServerAck = 8,
 }
 
 pub async fn send_frame<T: Serialize>(

@@ -14,6 +14,8 @@ pub enum ClientToMaster {
     GetChunkLocations { handle: ChunkHandle },
     /// ask master to allocate a new chunk for this file and pick replica locations
     AllocateChunk { filename: String },
+    /// ask master who the primary is for a chunk (master grants lease if none active)
+    GetPrimary { handle: ChunkHandle },
 }
 
 /// responses the master sends back to the client
@@ -27,6 +29,11 @@ pub enum MasterToClient {
     ChunkLocations {
         handle: ChunkHandle,
         locations: Vec<String>,
+    },
+    /// primary + secondaries for a chunk (used by client to coordinate writes)
+    PrimaryInfo {
+        primary: String,
+        secondaries: Vec<String>,
     },
     /// something went wrong
     Error(String),
