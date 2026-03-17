@@ -112,3 +112,65 @@ async fn test_lease_expiry_is_set() {
     let remaining = info.lease_expiry.unwrap().duration_since(Instant::now());
     assert!(remaining.as_secs() > 50);
 }
+
+#[tokio::test]
+async fn test_grant_lease_new() {
+    let m = make_master();
+    m.create_file("/f".into()).await;
+    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into(), "c:9000".into()]).await;
+
+    let (primary, secondaries) = m.grant_lease(1).await.unwrap();
+
+    // first location becomes primary
+    assert_eq!(primary, "a:9000");
+    assert_eq!(secondaries.len(), 2);
+    assert!(secondaries.contains(&"b:9000".to_string()));
+    assert!(secondaries.contains(&"c:9000".to_string()));
+
+    // version bumped from 1 to 2
+    let chunks = m.chunks.read().await;
+    assert_eq!(chunks[&1].version, 2);
+    assert_eq!(chunks[&1].primary, Some("a:9000".into()));
+}
+
+#[tokio::test]
+async fn test_grant_lease_reuses_existing() {
+    let m = make_master();
+    m.create_file("/f".into()).await;
+    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()]).await;
+
+    // first grant
+    let (p1, _) = m.grant_lease(1).await.unwrap();
+
+    // second grant while lease is still active should return same primary, no version bump
+    let (p2, _) = m.grant_lease(1).await.unwrap();
+    assert_eq!(p1, p2);
+
+    let chunks = m.chunks.read().await;
+    // version only bumped once (1 -> 2), not twice
+    assert_eq!(chunks[&1].version, 2);
+}
+
+#[tokio::test]
+async fn test_grant_lease_expired_regrants() {
+    // use 0-second expiry so lease expires immediately
+    let m = Master::new(0);
+    m.create_file("/f".into()).await;
+    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()]).await;
+
+    // first grant — version goes 1 -> 2
+    m.grant_lease(1).await.unwrap();
+
+    // lease expired immediately, so next grant bumps version again 2 -> 3
+    let (primary, _) = m.grant_lease(1).await.unwrap();
+    assert_eq!(primary, "a:9000");
+
+    let chunks = m.chunks.read().await;
+    assert_eq!(chunks[&1].version, 3);
+}
+
+#[tokio::test]
+async fn test_grant_lease_nonexistent_chunk() {
+    let m = make_master();
+    assert!(m.grant_lease(999).await.is_none());
+}

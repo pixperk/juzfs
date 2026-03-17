@@ -124,4 +124,39 @@ impl Master {
             .map(|s| s.addr.clone())
             .collect()
     }
+
+    ///grants lease to a chunkserver and returns the primary and secondaries for a chunk.
+    /// this is used when a client wants to write to a chunk and needs to know which chunkserver has the write lease (primary) and which ones hold replicas (secondaries).
+    pub async fn grant_lease(&self, handle: ChunkHandle) -> Option<(String, Vec<String>)> {
+        let mut chunks = self.chunks.write().await;
+        let info = chunks.get_mut(&handle)?;
+
+        // check if existing lease is still valid
+        if let (Some(primary), Some(expiry)) = (&info.primary, info.lease_expiry) {
+            if expiry > Instant::now() {
+                let secondaries = info
+                    .locations
+                    .iter()
+                    .filter(|l| *l != primary)
+                    .cloned()
+                    .collect();
+                return Some((primary.clone(), secondaries));
+            }
+        }
+
+        // grant new lease: pick first location as primary, bump version
+        let primary = info.locations.first()?.clone();
+        info.primary = Some(primary.clone());
+        info.version += 1;
+        info.lease_expiry = Some(Instant::now() + self.expiry);
+
+        let secondaries = info
+            .locations
+            .iter()
+            .filter(|l| *l != &primary)
+            .cloned()
+            .collect();
+
+        Some((primary, secondaries))
+    }
 }
