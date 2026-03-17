@@ -1,11 +1,8 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs, io,
-    path::PathBuf,
-};
+use std::{collections::HashSet, fs, io, num::NonZeroUsize, path::PathBuf};
 
 use crc32fast::Hasher;
-use tokio::sync::RwLock;
+use lru::LruCache;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::master::ChunkHandle;
 
@@ -45,7 +42,7 @@ pub struct ChunkServer {
     data_dir: PathBuf,
     addr: String,
     stored_chunks: RwLock<HashSet<ChunkHandle>>,
-    push_buffer: RwLock<HashMap<ChunkHandle, Vec<u8>>>,
+    push_buffer: Mutex<LruCache<ChunkHandle, Vec<u8>>>,
 }
 
 impl ChunkServer {
@@ -54,7 +51,7 @@ impl ChunkServer {
             data_dir,
             addr,
             stored_chunks: RwLock::new(HashSet::new()),
-            push_buffer: RwLock::new(HashMap::new()),
+            push_buffer: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
         }
     }
 
@@ -150,14 +147,14 @@ impl ChunkServer {
     }
 
     pub async fn buffer_push(&self, handle: ChunkHandle, data: Vec<u8>) {
-        let mut buffer = self.push_buffer.write().await;
-        buffer.insert(handle, data);
+        let mut buffer = self.push_buffer.lock().await;
+        buffer.put(handle, data);
     }
 
     pub async fn flush_push(&self, handle: ChunkHandle) -> io::Result<()> {
-        let mut buffer = self.push_buffer.write().await;
-        if let Some(data) = buffer.remove(&handle) {
-            drop(buffer); // release lock before I/O
+        let mut buffer = self.push_buffer.lock().await;
+        if let Some(data) = buffer.pop(&handle) {
+            drop(buffer);
             self.store_chunk(handle, data).await?;
         }
         Ok(())
