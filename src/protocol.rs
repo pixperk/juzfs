@@ -74,4 +74,37 @@ pub async fn read_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Resu
     Ok((msg_type, msg))
 }
 
+/// reads just the header + raw payload bytes, returns (msg_type, raw_bytes)
+/// use this when the server needs to check msg_type before deciding which enum to deserialize
+pub async fn read_raw_frame(stream: &mut TcpStream) -> io::Result<(u8, Vec<u8>)> {
+    let mut header = [0u8; HEADER_SIZE];
+    stream.read_exact(&mut header).await?;
+
+    if header[0..2] != MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
+    }
+
+    let _version = header[2];
+    let msg_type = header[3];
+    let len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+
+    if len > 64 * 1024 * 1024 + 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await?;
+
+    Ok((msg_type, payload))
+}
+
+/// deserialize raw bytes into a specific type
+pub fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
+    bincode::deserialize(payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 // message enums live in src/messages/

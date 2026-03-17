@@ -108,8 +108,20 @@ impl Master {
         let mut servers = self.chunkservers.write().await;
         if let Some(server) = servers.get_mut(addr) {
             server.last_heartbeat = Instant::now();
-            server.chunks = chunks;
+            server.chunks = chunks.clone();
             server.available_space = available_space;
+        }
+        drop(servers);
+
+        // rebuild chunk locations from heartbeat
+        // this is how master recovers location data on cold start
+        let mut chunk_map = self.chunks.write().await;
+        for handle in &chunks {
+            if let Some(info) = chunk_map.get_mut(handle) {
+                if !info.locations.contains(&addr.to_string()) {
+                    info.locations.push(addr.to_string());
+                }
+            }
         }
     }
 

@@ -32,6 +32,44 @@ impl Client {
         }
     }
 
+    /// create a file on the master
+    pub async fn create_file(&self, filename: &str) -> io::Result<()> {
+        let mut conn = TcpStream::connect(&self.master_addr).await?;
+        send_frame(
+            &mut conn,
+            MessageType::ClientToMaster,
+            &ClientToMaster::CreateFile {
+                filename: filename.to_string(),
+            },
+        )
+        .await?;
+        let (_, resp): (u8, MasterToClient) = read_frame(&mut conn).await?;
+        match resp {
+            MasterToClient::Ok => Ok(()),
+            MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response")),
+        }
+    }
+
+    /// ask master to allocate a new chunk for a file, returns (handle, locations)
+    pub async fn allocate_chunk(&self, filename: &str) -> io::Result<(ChunkHandle, Vec<String>)> {
+        let mut conn = TcpStream::connect(&self.master_addr).await?;
+        send_frame(
+            &mut conn,
+            MessageType::ClientToMaster,
+            &ClientToMaster::AllocateChunk {
+                filename: filename.to_string(),
+            },
+        )
+        .await?;
+        let (_, resp): (u8, MasterToClient) = read_frame(&mut conn).await?;
+        match resp {
+            MasterToClient::ChunkLocations { handle, locations } => Ok((handle, locations)),
+            MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response")),
+        }
+    }
+
     pub async fn read(&self, filename: &str, offset: u64, length: u64) -> io::Result<Vec<u8>> {
         let metadata = self.get_chunk_metadata(filename).await?;
 
