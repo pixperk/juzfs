@@ -4,9 +4,42 @@ use std::{
     path::PathBuf,
 };
 
+use crc32fast::Hasher;
 use tokio::sync::RwLock;
 
 use crate::master::ChunkHandle;
+
+const BLOCK_SIZE: usize = 64 * 1024; // 64KB blocks, same as GFS
+
+/// compute a crc32 checksum for each 64KB block of data
+fn compute_checksums(data: &[u8]) -> Vec<u32> {
+    data.chunks(BLOCK_SIZE)
+        .map(|block| {
+            let mut hasher = Hasher::new();
+            hasher.update(block);
+            hasher.finalize()
+        })
+        .collect()
+}
+
+/// serialize checksums to bytes (4 bytes per checksum, big-endian)
+fn checksums_to_bytes(checksums: &[u32]) -> Vec<u8> {
+    checksums.iter().flat_map(|c| c.to_be_bytes()).collect()
+}
+
+/// deserialize bytes back to checksums
+fn bytes_to_checksums(bytes: &[u8]) -> io::Result<Vec<u32>> {
+    if bytes.len() % 4 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupt checksum file",
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
 
 pub struct ChunkServer {
     data_dir: PathBuf,
@@ -37,12 +70,12 @@ impl ChunkServer {
             .join(format!("{:08x}.csum", handle))
     }
 
-    pub fn init(&self) -> io::Result<()> {
+    pub async fn init(&self) -> io::Result<()> {
         fs::create_dir_all(self.data_dir.join("chunks"))?;
         fs::create_dir_all(self.data_dir.join("checksums"))?;
 
         // recover: scan existing chunk files into stored_chunks
-        let mut stored = self.stored_chunks.blocking_write();
+        let mut stored = self.stored_chunks.write().await;
         for entry in fs::read_dir(self.data_dir.join("chunks"))? {
             let entry = entry?;
             if let Some(name) = entry.path().file_stem().and_then(|s| s.to_str()) {
@@ -66,9 +99,9 @@ impl ChunkServer {
         // write chunk data
         fs::write(&chunk_path, &data)?;
 
-        // compute and write checksum (simple sum of bytes for demo)
-        let checksum: u32 = data.iter().map(|b| *b as u32).sum();
-        fs::write(&checksum_path, checksum.to_be_bytes())?;
+        // compute crc32 per 64KB block and write
+        let checksums = compute_checksums(&data);
+        fs::write(&checksum_path, checksums_to_bytes(&checksums))?;
 
         // update in-memory state
         let mut stored = self.stored_chunks.write().await;
@@ -92,18 +125,25 @@ impl ChunkServer {
             ));
         }
 
-        // verify checksum
-        let stored_csum = fs::read(self.checksum_path(handle))?;
-        let expected =
-            u32::from_be_bytes(stored_csum.try_into().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "corrupt checksum file")
-            })?);
-        let actual: u32 = data.iter().map(|b| *b as u32).sum();
-        if actual != expected {
+        // verify per-block crc32 checksums
+        let stored_bytes = fs::read(self.checksum_path(handle))?;
+        let expected = bytes_to_checksums(&stored_bytes)?;
+        let actual = compute_checksums(&data);
+
+        if expected.len() != actual.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "checksum mismatch",
+                "checksum block count mismatch",
             ));
+        }
+
+        for (i, (exp, act)) in expected.iter().zip(actual.iter()).enumerate() {
+            if exp != act {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("checksum mismatch at block {}", i),
+                ));
+            }
         }
 
         Ok(data[offset..offset + length].to_vec())
