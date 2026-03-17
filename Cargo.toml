@@ -3,14 +3,6 @@ name = "juzfs"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "master"
-path = "src/bin/master.rs"
-
-[[bin]]
-name = "chunkserver"
-path = "src/bin/chunkserver.rs"
-
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

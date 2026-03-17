@@ -40,6 +40,7 @@ impl Master {
         }
     }
 
+    ///allocates a new unique chunkhandle by incrementing a counter. this is used whenever a new chunk is created for a file.
     pub async fn allocate_chunk_handle(&self) -> ChunkHandle {
         let mut handle = self.next_chunk_handle.write().await;
         let h = *handle;
@@ -47,11 +48,13 @@ impl Master {
         h
     }
 
+    ///creates a file entry in master metadata
     pub async fn create_file(&self, filename: String) {
         let mut files = self.files.write().await;
         files.insert(filename, Vec::new());
     }
 
+    ///allocates a new chunkhandle for a file and updates the master's metadata to reflect the new chunk and its locations. used when a client writes to a file and needs to create a new chunk.
     pub async fn add_chunk(&self, filename: &str, locations: Vec<String>) -> Option<ChunkHandle> {
         let handle = self.allocate_chunk_handle().await;
 
@@ -73,16 +76,19 @@ impl Master {
         Some(handle)
     }
 
+    ///given a chunkhandle, return the list of chunkservers that hold replicas of that chunk. used by clients to know where to read/write data.
     pub async fn get_chunk_locations(&self, handle: ChunkHandle) -> Option<Vec<String>> {
         let chunks = self.chunks.read().await;
         chunks.get(&handle).map(|info| info.locations.clone())
     }
 
+    ///get chunnkhandles associated with a given filename, used by clients to know which chunks to read/write for a file.
     pub async fn get_file_chunks(&self, filename: &str) -> Option<Vec<ChunkHandle>> {
         let files = self.files.read().await;
         files.get(filename).cloned()
     }
 
+    ///registers a chunkserver with the master, storing its address and available space for future placement decisions.
     pub async fn register_chunkserver(&self, addr: String, available_space: u64) {
         let mut servers = self.chunkservers.write().await;
         servers.insert(
@@ -96,6 +102,8 @@ impl Master {
         );
     }
 
+    /// stores the last heartbeat instance for a chunkserver and the chunks it reports holding.
+    /// this is used to detect failed chunkservers and update chunk locations.
     pub async fn heartbeat(&self, addr: &str, chunks: Vec<ChunkHandle>) {
         let mut servers = self.chunkservers.write().await;
         if let Some(server) = servers.get_mut(addr) {
