@@ -59,10 +59,11 @@ async fn test_register_and_heartbeat() {
         assert!(servers["10.0.0.1:9000"].chunks.is_empty());
     }
 
-    m.heartbeat("10.0.0.1:9000", vec![1, 2, 3]).await;
+    m.heartbeat("10.0.0.1:9000", vec![1, 2, 3], 400).await;
 
     let servers = m.chunkservers.read().await;
     assert_eq!(servers["10.0.0.1:9000"].chunks, vec![1, 2, 3]);
+    assert_eq!(servers["10.0.0.1:9000"].available_space, 400);
 }
 
 #[tokio::test]

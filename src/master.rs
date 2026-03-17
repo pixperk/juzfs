@@ -104,11 +104,12 @@ impl Master {
 
     /// stores the last heartbeat instance for a chunkserver and the chunks it reports holding.
     /// this is used to detect failed chunkservers and update chunk locations.
-    pub async fn heartbeat(&self, addr: &str, chunks: Vec<ChunkHandle>) {
+    pub async fn heartbeat(&self, addr: &str, chunks: Vec<ChunkHandle>, available_space: u64) {
         let mut servers = self.chunkservers.write().await;
         if let Some(server) = servers.get_mut(addr) {
             server.last_heartbeat = Instant::now();
             server.chunks = chunks;
+            server.available_space = available_space;
         }
     }
 
