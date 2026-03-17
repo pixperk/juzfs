@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs, io, num::NonZeroUsize, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fs, io,
+    num::NonZeroUsize,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crc32fast::Hasher;
 use lru::LruCache;
@@ -43,6 +49,9 @@ pub struct ChunkServer {
     addr: String,
     stored_chunks: RwLock<HashSet<ChunkHandle>>,
     push_buffer: Mutex<LruCache<ChunkHandle, Vec<u8>>>,
+    /// monotonically increasing serial number, only used when this CS acts as primary
+    /// ensures all replicas apply mutations in the same order
+    next_serial: AtomicU64,
 }
 
 impl ChunkServer {
@@ -52,6 +61,7 @@ impl ChunkServer {
             addr,
             stored_chunks: RwLock::new(HashSet::new()),
             push_buffer: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
+            next_serial: AtomicU64::new(0),
         }
     }
 
@@ -175,6 +185,12 @@ impl ChunkServer {
 
     pub async fn list_chunks(&self) -> Vec<ChunkHandle> {
         self.stored_chunks.read().await.iter().copied().collect()
+    }
+
+    /// assign next serial number (only meaningful when acting as primary)
+    /// guarantees all replicas apply writes in the same global order
+    pub fn next_serial(&self) -> u64 {
+        self.next_serial.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn addr(&self) -> &str {

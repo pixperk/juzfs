@@ -164,13 +164,13 @@ impl Client {
 
             // build chain: primary first, then secondaries
             let mut chain = vec![primary.clone()];
-            chain.extend(secondaries);
+            chain.extend(secondaries.clone());
 
             // phase 1: push data to all replicas via chain
             self.push_data_chain(&chain, handle, chunk_data).await?;
 
-            // phase 2: tell primary to commit
-            self.commit_write(&primary, handle).await?;
+            // phase 2: tell primary to commit (primary coordinates secondaries)
+            self.commit_write(&primary, handle, secondaries).await?;
         }
 
         Ok(())
@@ -360,13 +360,14 @@ impl Client {
     }
 
     /// phase 2: tell the primary to commit buffered data
-    /// primary assigns serial number, flushes, tells secondaries to flush
-    async fn commit_write(&self, primary: &str, handle: ChunkHandle) -> io::Result<()> {
+    /// primary assigns serial number, flushes its own buffer,
+    /// then sends CommitWrite to each secondary in serial order
+    async fn commit_write(&self, primary: &str, handle: ChunkHandle, secondaries: Vec<String>) -> io::Result<()> {
         let mut conn = TcpStream::connect(primary).await?;
         send_frame(
             &mut conn,
             MessageType::ClientToChunkServer,
-            &ClientToChunkServer::Write { handle },
+            &ClientToChunkServer::Write { handle, secondaries },
         )
         .await?;
 

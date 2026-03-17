@@ -19,8 +19,13 @@ pub enum ClientToChunkServer {
         data: Vec<u8>,
     },
     /// phase 2 of write: tell the primary to commit the buffered data
-    /// primary assigns a serial number and forwards to secondaries
-    Write { handle: ChunkHandle },
+    /// primary assigns a serial number, flushes its own buffer,
+    /// then forwards CommitWrite to each secondary in serial order
+    /// client passes secondaries so primary knows who to coordinate with
+    Write {
+        handle: ChunkHandle,
+        secondaries: Vec<String>,
+    },
 }
 
 /// responses chunkserver sends back to the client

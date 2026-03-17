@@ -46,12 +46,58 @@ async fn handle_client_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[
             cs.buffer_push(handle, data).await;
             ChunkServerToClient::Ok
         }
-        ClientToChunkServer::Write { handle } => {
-            // primary: flush own buffer, then tell secondaries to flush
-            match cs.flush_push(handle).await {
-                Ok(_) => ChunkServerToClient::Ok,
-                Err(e) => ChunkServerToClient::Error(e.to_string()),
+        ClientToChunkServer::Write { handle, secondaries } => {
+            // primary coordination: the single point of write ordering
+            // 1. assign a monotonic serial — this is the global order all replicas obey
+            let serial = cs.next_serial();
+
+            // 2. flush own buffer first (primary commits before asking secondaries)
+            if let Err(e) = cs.flush_push(handle).await {
+                let _ = send_frame(stream, MessageType::ChunkServerToClient,
+                    &ChunkServerToClient::Error(e.to_string())).await;
+                return;
             }
+
+            // 3. tell each secondary to commit with the same serial number
+            //    done sequentially so secondaries apply in serial order
+            for addr in &secondaries {
+                let commit = ChunkServerToChunkServer::CommitWrite { handle, serial };
+                match TcpStream::connect(addr).await {
+                    Ok(mut conn) => {
+                        if let Err(e) = send_frame(
+                            &mut conn,
+                            MessageType::ChunkServerToChunkServer,
+                            &commit,
+                        ).await {
+                            let _ = send_frame(stream, MessageType::ChunkServerToClient,
+                                &ChunkServerToClient::Error(format!("secondary {} send failed: {}", addr, e))).await;
+                            return;
+                        }
+                        // wait for secondary ack
+                        match juzfs::protocol::read_frame::<ChunkServerAck>(&mut conn).await {
+                            Ok((_, ChunkServerAck::Ok)) => {}
+                            Ok((_, ChunkServerAck::Error(e))) => {
+                                let _ = send_frame(stream, MessageType::ChunkServerToClient,
+                                    &ChunkServerToClient::Error(format!("secondary {} failed: {}", addr, e))).await;
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = send_frame(stream, MessageType::ChunkServerToClient,
+                                    &ChunkServerToClient::Error(format!("secondary {} ack failed: {}", addr, e))).await;
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = send_frame(stream, MessageType::ChunkServerToClient,
+                            &ChunkServerToClient::Error(format!("secondary {} unreachable: {}", addr, e))).await;
+                        return;
+                    }
+                }
+            }
+
+            // 4. all replicas committed in serial order, ack client
+            ChunkServerToClient::Ok
         }
     };
 
