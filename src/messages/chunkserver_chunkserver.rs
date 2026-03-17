@@ -18,6 +18,14 @@ pub enum ChunkServerToChunkServer {
         handle: ChunkHandle,
         serial: u64, // serial number assigned by primary for ordering
     },
+    /// primary tells secondaries to append data at exact offset
+    /// all replicas must write at the same offset for consistency
+    CommitAppend {
+        handle: ChunkHandle,
+        data: Vec<u8>,
+        offset: u64,
+        serial: u64,
+    },
 }
 
 /// ack from one chunkserver to another

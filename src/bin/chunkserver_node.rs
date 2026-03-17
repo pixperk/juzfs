@@ -99,6 +99,51 @@ async fn handle_client_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[
             // 4. all replicas committed in serial order, ack client
             ChunkServerToClient::Ok
         }
+        ClientToChunkServer::Append { handle, data, secondaries } => {
+            let max_chunk = juzfs::CHUNK_SIZE;
+            let current_size = cs.chunk_size_on_disk(handle).unwrap_or(0);
+
+            if current_size + data.len() as u64 > max_chunk {
+                // pad chunk, tell secondaries to pad, ask client to retry on new chunk
+                let _ = cs.pad_chunk(handle, max_chunk).await;
+                for addr in &secondaries {
+                    if let Ok(mut c) = TcpStream::connect(addr).await {
+                        let pad = ChunkServerToChunkServer::CommitAppend {
+                            handle, data: vec![], offset: max_chunk, serial: cs.next_serial(),
+                        };
+                        let _ = send_frame(&mut c, MessageType::ChunkServerToChunkServer, &pad).await;
+                        let _: Result<(u8, ChunkServerAck), _> = juzfs::protocol::read_frame(&mut c).await;
+                    }
+                }
+                ChunkServerToClient::RetryNewChunk
+            } else {
+                let offset = current_size;
+                let serial = cs.next_serial();
+
+                if let Err(e) = cs.append_to_chunk(handle, &data, offset).await {
+                    ChunkServerToClient::Error(e.to_string())
+                } else {
+                    let mut all_ok = true;
+                    for addr in &secondaries {
+                        let commit = ChunkServerToChunkServer::CommitAppend {
+                            handle, data: data.clone(), offset, serial,
+                        };
+                        match TcpStream::connect(addr).await {
+                            Ok(mut c) => {
+                                let _ = send_frame(&mut c, MessageType::ChunkServerToChunkServer, &commit).await;
+                                match juzfs::protocol::read_frame::<ChunkServerAck>(&mut c).await {
+                                    Ok((_, ChunkServerAck::Ok)) => {}
+                                    _ => { all_ok = false; break; }
+                                }
+                            }
+                            Err(_) => { all_ok = false; break; }
+                        }
+                    }
+                    if all_ok { ChunkServerToClient::AppendOk { offset } }
+                    else { ChunkServerToClient::Error("secondary append failed".into()) }
+                }
+            }
+        }
     };
 
     let _ = send_frame(stream, MessageType::ChunkServerToClient, &response).await;
@@ -145,6 +190,19 @@ async fn handle_cs_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[u8])
             match cs.flush_push(handle).await {
                 Ok(_) => ChunkServerAck::Ok,
                 Err(e) => ChunkServerAck::Error(e.to_string()),
+            }
+        }
+        ChunkServerToChunkServer::CommitAppend { handle, data, offset, .. } => {
+            if data.is_empty() {
+                match cs.pad_chunk(handle, juzfs::CHUNK_SIZE).await {
+                    Ok(_) => ChunkServerAck::Ok,
+                    Err(e) => ChunkServerAck::Error(e.to_string()),
+                }
+            } else {
+                match cs.append_to_chunk(handle, &data, offset).await {
+                    Ok(_) => ChunkServerAck::Ok,
+                    Err(e) => ChunkServerAck::Error(e.to_string()),
+                }
             }
         }
     };

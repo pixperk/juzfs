@@ -9,6 +9,9 @@ use juzfs::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
+/// small chunk size for testing (256 bytes instead of 64MB)
+const TEST_CHUNK_SIZE: u64 = 256;
+
 // ---- master TCP server (in-process) ----
 
 async fn master_handle(mut stream: TcpStream, master: Arc<Master>) {
@@ -149,6 +152,54 @@ async fn cs_handle(mut stream: TcpStream, cs: Arc<ChunkServer>) {
                         if all_ok { ChunkServerToClient::Ok }
                         else { ChunkServerToClient::Error("secondary commit failed".into()) }
                     }
+                    ClientToChunkServer::Append { handle, data, secondaries } => {
+                        let max_chunk = TEST_CHUNK_SIZE;
+                        let current_size = cs.chunk_size_on_disk(handle).unwrap_or(0);
+
+                        // check if append fits in this chunk
+                        if current_size + data.len() as u64 > max_chunk {
+                            // pad chunk on all replicas, tell client to retry on new chunk
+                            let _ = cs.pad_chunk(handle, max_chunk).await;
+                            for addr in &secondaries {
+                                if let Ok(mut c) = TcpStream::connect(addr).await {
+                                    let pad = ChunkServerToChunkServer::CommitAppend {
+                                        handle, data: vec![], offset: max_chunk, serial: cs.next_serial(),
+                                    };
+                                    let _ = send_frame(&mut c, MessageType::ChunkServerToChunkServer, &pad).await;
+                                    let _: Result<(u8, ChunkServerAck), _> = juzfs::protocol::read_frame(&mut c).await;
+                                }
+                            }
+                            ChunkServerToClient::RetryNewChunk
+                        } else {
+                            let offset = current_size;
+                            let serial = cs.next_serial();
+
+                            // append on primary
+                            if let Err(e) = cs.append_to_chunk(handle, &data, offset).await {
+                                ChunkServerToClient::Error(e.to_string())
+                            } else {
+                                // tell secondaries to append at same offset
+                                let mut all_ok = true;
+                                for addr in &secondaries {
+                                    let commit = ChunkServerToChunkServer::CommitAppend {
+                                        handle, data: data.clone(), offset, serial,
+                                    };
+                                    match TcpStream::connect(addr).await {
+                                        Ok(mut c) => {
+                                            let _ = send_frame(&mut c, MessageType::ChunkServerToChunkServer, &commit).await;
+                                            match juzfs::protocol::read_frame::<ChunkServerAck>(&mut c).await {
+                                                Ok((_, ChunkServerAck::Ok)) => {}
+                                                _ => { all_ok = false; break; }
+                                            }
+                                        }
+                                        Err(_) => { all_ok = false; break; }
+                                    }
+                                }
+                                if all_ok { ChunkServerToClient::AppendOk { offset } }
+                                else { ChunkServerToClient::Error("secondary append failed".into()) }
+                            }
+                        }
+                    }
                 };
                 let _ = send_frame(&mut stream, MessageType::ChunkServerToClient, &resp).await;
             }
@@ -175,6 +226,20 @@ async fn cs_handle(mut stream: TcpStream, cs: Arc<ChunkServer>) {
                         match cs.flush_push(handle).await {
                             Ok(_) => ChunkServerAck::Ok,
                             Err(e) => ChunkServerAck::Error(e.to_string()),
+                        }
+                    }
+                    ChunkServerToChunkServer::CommitAppend { handle, data, offset, .. } => {
+                        if data.is_empty() {
+                            // pad command
+                            match cs.pad_chunk(handle, TEST_CHUNK_SIZE).await {
+                                Ok(_) => ChunkServerAck::Ok,
+                                Err(e) => ChunkServerAck::Error(e.to_string()),
+                            }
+                        } else {
+                            match cs.append_to_chunk(handle, &data, offset).await {
+                                Ok(_) => ChunkServerAck::Ok,
+                                Err(e) => ChunkServerAck::Error(e.to_string()),
+                            }
                         }
                     }
                 };
@@ -230,7 +295,7 @@ async fn main() {
 
     println!("[ok] master + 3 chunkservers running\n");
 
-    let client = Client::new("127.0.0.1:5000".into(), 64 * 1024 * 1024);
+    let client = Client::new("127.0.0.1:5000".into(), TEST_CHUNK_SIZE);
 
     // --- test 1: create + write + offset read ---
     println!("--- test 1: write + offset read ---");
@@ -294,6 +359,49 @@ async fn main() {
             .collect();
         println!("  {} has {} chunk(s) on disk", dir, chunks.len());
     }
+    println!("  PASSED\n");
+
+    // --- test 5: record append ---
+    println!("--- test 5: record append ---");
+    client.create_file("/append.log").await.unwrap();
+    client.allocate_chunk("/append.log").await.unwrap();
+
+    let offset1 = client.append("/append.log", b"line one\n").await.unwrap();
+    println!("  append 1 at offset {}", offset1);
+    assert_eq!(offset1, 0);
+
+    let offset2 = client.append("/append.log", b"line two\n").await.unwrap();
+    println!("  append 2 at offset {}", offset2);
+    assert_eq!(offset2, 9);
+
+    let offset3 = client.append("/append.log", b"line three\n").await.unwrap();
+    println!("  append 3 at offset {}", offset3);
+    assert_eq!(offset3, 18);
+
+    // read back all appended data
+    let all = client.read("/append.log", 0, 29).await.unwrap();
+    assert_eq!(&all, b"line one\nline two\nline three\n");
+    println!("  read all: \"{}\"", String::from_utf8_lossy(&all));
+    println!("  PASSED\n");
+
+    // --- test 6: append triggers new chunk allocation (chunk_size=256) ---
+    println!("--- test 6: append overflow to new chunk ---");
+    client.create_file("/big_append.log").await.unwrap();
+    client.allocate_chunk("/big_append.log").await.unwrap();
+
+    // fill up the chunk (256 bytes) with multiple appends
+    let line = b"abcdefghijklmnopqrstuvwxyz0123\n"; // 31 bytes
+    let mut total_written = 0u64;
+    for i in 0..8 {
+        let offset = client.append("/big_append.log", line).await.unwrap();
+        println!("  append {} at offset {}", i, offset);
+        total_written += line.len() as u64;
+    }
+    // 8 * 31 = 248 bytes, fits in one chunk
+    // 9th append (248 + 31 = 279 > 256) should trigger new chunk
+    let overflow_offset = client.append("/big_append.log", line).await.unwrap();
+    println!("  overflow append at offset {} (new chunk)", overflow_offset);
+    assert_eq!(overflow_offset, 0); // starts at 0 in the new chunk
     println!("  PASSED\n");
 
     println!("=== all tests passed ===");

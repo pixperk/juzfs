@@ -26,6 +26,15 @@ pub enum ClientToChunkServer {
         handle: ChunkHandle,
         secondaries: Vec<String>,
     },
+    /// record append: client specifies only data, primary picks the offset
+    /// if data fits in current chunk (< 64MB), append at EOF on all replicas
+    /// if not, primary pads the chunk and responds with RetryNewChunk
+    /// so client allocates a new chunk and retries
+    Append {
+        handle: ChunkHandle,
+        data: Vec<u8>,
+        secondaries: Vec<String>,
+    },
 }
 
 /// responses chunkserver sends back to the client
@@ -35,6 +44,10 @@ pub enum ChunkServerToClient {
     Data(Vec<u8>),
     /// generic success (write ack, push ack)
     Ok,
+    /// append succeeded, returns the offset where data was written
+    AppendOk { offset: u64 },
+    /// chunk is too full for this append, client should allocate a new chunk and retry
+    RetryNewChunk,
     /// something went wrong
     Error(String),
 }

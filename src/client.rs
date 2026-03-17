@@ -450,4 +450,60 @@ impl Client {
             )),
         }
     }
+
+    /// record append: client specifies only data, primary picks the offset
+    /// if current last chunk is too full, allocates a new chunk and retries
+    /// returns the offset where data was written
+    pub async fn append(&self, filename: &str, data: &[u8]) -> io::Result<u64> {
+        loop {
+            let metadata = self.get_chunk_metadata(filename).await?;
+            if metadata.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "file has no chunks",
+                ));
+            }
+
+            // always append to the last chunk
+            let (handle, _) = metadata[metadata.len() - 1];
+            let (primary, secondaries) = self.get_primary(handle).await?;
+
+            let mut conn = TcpStream::connect(&primary).await?;
+            send_frame(
+                &mut conn,
+                MessageType::ClientToChunkServer,
+                &ClientToChunkServer::Append {
+                    handle,
+                    data: data.to_vec(),
+                    secondaries,
+                },
+            )
+            .await?;
+
+            let (_, resp): (u8, ChunkServerToClient) = read_frame(&mut conn).await?;
+            match resp {
+                ChunkServerToClient::AppendOk { offset } => return Ok(offset),
+                ChunkServerToClient::RetryNewChunk => {
+                    // current chunk full, allocate new one and retry
+                    self.invalidate_cache(filename).await;
+                    self.allocate_chunk(filename).await?;
+                }
+                ChunkServerToClient::Error(e) => {
+                    return Err(io::Error::new(io::ErrorKind::Other, e))
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected response",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// clear cached metadata for a file (used after allocating new chunk)
+    async fn invalidate_cache(&self, filename: &str) {
+        let mut cache = self.metadata_cache.write().await;
+        cache.remove(filename);
+    }
 }

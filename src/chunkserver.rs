@@ -173,6 +173,61 @@ impl ChunkServer {
         Ok(())
     }
 
+    /// get current size of a chunk on disk (used by primary to check if append fits)
+    pub fn chunk_size_on_disk(&self, handle: ChunkHandle) -> io::Result<u64> {
+        let meta = fs::metadata(self.chunk_path(handle))?;
+        Ok(meta.len())
+    }
+
+    /// append data to an existing chunk at a specific offset
+    /// rewrites the full file (read + append + rewrite checksums)
+    /// all replicas must append at the same offset for consistency
+    pub async fn append_to_chunk(&self, handle: ChunkHandle, data: &[u8], offset: u64) -> io::Result<()> {
+        let chunk_path = self.chunk_path(handle);
+        let checksum_path = self.checksum_path(handle);
+
+        // read existing data, extend at offset
+        let mut existing = if chunk_path.exists() {
+            fs::read(&chunk_path)?
+        } else {
+            Vec::new()
+        };
+
+        // pad if offset is past current length (shouldn't happen normally)
+        if (offset as usize) > existing.len() {
+            existing.resize(offset as usize, 0);
+        }
+
+        // truncate to offset and append new data
+        existing.truncate(offset as usize);
+        existing.extend_from_slice(data);
+
+        // rewrite chunk + checksums
+        fs::write(&chunk_path, &existing)?;
+        let checksums = compute_checksums(&existing);
+        fs::write(&checksum_path, checksums_to_bytes(&checksums))?;
+
+        let mut stored = self.stored_chunks.write().await;
+        stored.insert(handle);
+
+        Ok(())
+    }
+
+    /// pad a chunk to exactly 64MB (used when append doesn't fit, before moving to next chunk)
+    pub async fn pad_chunk(&self, handle: ChunkHandle, max_chunk_size: u64) -> io::Result<()> {
+        let chunk_path = self.chunk_path(handle);
+        let checksum_path = self.checksum_path(handle);
+
+        let mut data = fs::read(&chunk_path)?;
+        data.resize(max_chunk_size as usize, 0);
+
+        fs::write(&chunk_path, &data)?;
+        let checksums = compute_checksums(&data);
+        fs::write(&checksum_path, checksums_to_bytes(&checksums))?;
+
+        Ok(())
+    }
+
     pub async fn delete_chunk(&self, handle: ChunkHandle) -> io::Result<()> {
         let chunk_path = self.chunk_path(handle);
         let checksum_path = self.checksum_path(handle);
