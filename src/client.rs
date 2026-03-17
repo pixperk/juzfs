@@ -47,7 +47,10 @@ impl Client {
         match resp {
             MasterToClient::Ok => Ok(()),
             MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
         }
     }
 
@@ -66,7 +69,10 @@ impl Client {
         match resp {
             MasterToClient::ChunkLocations { handle, locations } => Ok((handle, locations)),
             MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected response")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
         }
     }
 
@@ -123,6 +129,61 @@ impl Client {
         }
 
         Ok(result)
+    }
+
+    pub async fn read_stream(
+        &self,
+        filename: &str,
+    ) -> io::Result<tokio::sync::mpsc::Receiver<io::Result<Vec<u8>>>> {
+        let metadata = self.get_chunk_metadata(filename).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(4); // buffer 4 chunks ahead
+
+        let chunk_size = self.chunk_size;
+
+        tokio::spawn(async move {
+            for (i, (handle, locations)) in metadata.into_iter().enumerate() {
+                // try each replica
+                let mut success = false;
+                for addr in &locations {
+                    let mut conn = match TcpStream::connect(addr).await {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let msg = ClientToChunkServer::Read {
+                        handle,
+                        offset: 0,
+                        length: chunk_size,
+                    };
+                    if send_frame(&mut conn, MessageType::ClientToChunkServer, &msg)
+                        .await
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    match read_frame::<ChunkServerToClient>(&mut conn).await {
+                        Ok((_, ChunkServerToClient::Data(bytes))) => {
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                return;
+                            }
+                            success = true;
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+                if !success {
+                    let _ = tx
+                        .send(Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("all replicas failed for chunk {}", i),
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     /// write data to a file at a given offset
@@ -362,12 +423,20 @@ impl Client {
     /// phase 2: tell the primary to commit buffered data
     /// primary assigns serial number, flushes its own buffer,
     /// then sends CommitWrite to each secondary in serial order
-    async fn commit_write(&self, primary: &str, handle: ChunkHandle, secondaries: Vec<String>) -> io::Result<()> {
+    async fn commit_write(
+        &self,
+        primary: &str,
+        handle: ChunkHandle,
+        secondaries: Vec<String>,
+    ) -> io::Result<()> {
         let mut conn = TcpStream::connect(primary).await?;
         send_frame(
             &mut conn,
             MessageType::ClientToChunkServer,
-            &ClientToChunkServer::Write { handle, secondaries },
+            &ClientToChunkServer::Write {
+                handle,
+                secondaries,
+            },
         )
         .await?;
 
