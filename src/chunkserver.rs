@@ -125,12 +125,15 @@ impl ChunkServer {
     ) -> io::Result<Vec<u8>> {
         let data = fs::read(self.chunk_path(handle))?;
 
-        if offset + length > data.len() {
+        if offset >= data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "read out of bounds",
+                "read offset past end of chunk",
             ));
         }
+
+        // clamp length to available data (last chunk may be smaller than chunk_size)
+        let length = length.min(data.len() - offset);
 
         // verify per-block crc32 checksums
         let stored_bytes = fs::read(self.checksum_path(handle))?;
