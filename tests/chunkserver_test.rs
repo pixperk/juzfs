@@ -2,7 +2,7 @@ use juzfs::chunkserver::ChunkServer;
 use tempfile::tempdir;
 
 async fn make_chunkserver(dir: &std::path::Path) -> ChunkServer {
-    let cs = ChunkServer::new(dir.to_path_buf(), "127.0.0.1:9000".into());
+    let cs = ChunkServer::new(dir.to_path_buf(), "127.0.0.1:9000".into(), 1_000_000_000);
     cs.init().await.unwrap();
     cs
 }

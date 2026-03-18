@@ -216,7 +216,7 @@ async fn heartbeat_loop(cs: Arc<ChunkServer>, master_addr: String) {
     if let Ok(mut conn) = TcpStream::connect(&master_addr).await {
         let register = ChunkServerToMaster::Register {
             addr: cs.addr().to_string(),
-            available_space: 1_000_000_000, // 1GB placeholder
+            available_space: cs.available_space(),
         };
         let _ = send_frame(&mut conn, MessageType::ChunkServerToMaster, &register).await;
         let _: Result<(u8, MasterToChunkServer), _> =
@@ -232,7 +232,7 @@ async fn heartbeat_loop(cs: Arc<ChunkServer>, master_addr: String) {
             let hb = ChunkServerToMaster::Heartbeat {
                 addr: cs.addr().to_string(),
                 chunks,
-                available_space: 1_000_000_000,
+                available_space: cs.available_space(),
             };
             let _ = send_frame(&mut conn, MessageType::ChunkServerToMaster, &hb).await;
             let _: Result<(u8, MasterToChunkServer), _> =
@@ -256,7 +256,8 @@ async fn main() {
     let data_dir = &args[2];
     let master_addr = args[3].clone();
 
-    let cs = Arc::new(ChunkServer::new(data_dir.into(), addr.clone()));
+    let capacity: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1_000_000_000);
+    let cs = Arc::new(ChunkServer::new(data_dir.into(), addr.clone(), capacity));
     if let Err(e) = cs.init().await {
         eprintln!("failed to init chunkserver: {}", e);
         return;

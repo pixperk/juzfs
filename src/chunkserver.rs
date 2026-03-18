@@ -47,6 +47,7 @@ fn bytes_to_checksums(bytes: &[u8]) -> io::Result<Vec<u32>> {
 pub struct ChunkServer {
     data_dir: PathBuf,
     addr: String,
+    capacity: u64,
     stored_chunks: RwLock<HashSet<ChunkHandle>>,
     push_buffer: Mutex<LruCache<ChunkHandle, Vec<u8>>>,
     /// monotonically increasing serial number, only used when this CS acts as primary
@@ -55,10 +56,11 @@ pub struct ChunkServer {
 }
 
 impl ChunkServer {
-    pub fn new(data_dir: PathBuf, addr: String) -> Self {
+    pub fn new(data_dir: PathBuf, addr: String, capacity: u64) -> Self {
         Self {
             data_dir,
             addr,
+            capacity,
             stored_chunks: RwLock::new(HashSet::new()),
             push_buffer: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
             next_serial: AtomicU64::new(0),
@@ -253,5 +255,23 @@ impl ChunkServer {
 
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    pub fn available_space(&self) -> u64 {
+        self.capacity.saturating_sub(self.used_space())
+    }
+
+    /// total bytes used by chunk files on disk
+    pub fn used_space(&self) -> u64 {
+        let chunks_dir = self.data_dir.join("chunks");
+        fs::read_dir(chunks_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 }
