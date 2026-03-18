@@ -11,15 +11,14 @@ async fn handle_connection(mut stream: TcpStream, master: Arc<Master>) {
     loop {
         let (msg_type, payload) = match read_raw_frame(&mut stream).await {
             Ok(v) => v,
-            Err(_) => break, // client disconnected
+            Err(_) => break,
         };
 
         match msg_type {
-            //1 is for client messages, 3 is for chunkserver messages
             1 => handle_client_msg(&mut stream, &master, &payload).await,
             3 => handle_chunkserver_msg(&mut stream, &master, &payload).await,
             _ => {
-                tracing::warn!("unknown msg_type: {}", msg_type);
+                tracing::warn!(msg_type, "unknown message type, dropping connection");
                 break;
             }
         }
@@ -29,47 +28,74 @@ async fn handle_connection(mut stream: TcpStream, master: Arc<Master>) {
 async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u8]) {
     let msg: ClientToMaster = match decode_payload(payload) {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to decode client message");
+            return;
+        }
     };
 
     let response = match msg {
         ClientToMaster::CreateFile { filename } => {
+            tracing::info!(file = %filename, "create file");
             master.create_file(filename).await;
             MasterToClient::Ok
         }
         ClientToMaster::GetFileChunks { filename } => {
             match master.get_file_chunks(&filename).await {
-                Some(chunks) => MasterToClient::FileChunks(chunks),
-                None => MasterToClient::Error("file not found".into()),
+                Some(chunks) => {
+                    tracing::debug!(file = %filename, chunks = chunks.len(), "get file chunks");
+                    MasterToClient::FileChunks(chunks)
+                }
+                None => {
+                    tracing::warn!(file = %filename, "file not found");
+                    MasterToClient::Error("file not found".into())
+                }
             }
         }
         ClientToMaster::GetChunkLocations { handle } => {
             match master.get_chunk_locations(handle).await {
-                Some(locations) => MasterToClient::ChunkLocations { handle, locations },
-                None => MasterToClient::Error("chunk not found".into()),
+                Some(locations) => {
+                    tracing::debug!(chunk = handle, replicas = locations.len(), "get chunk locations");
+                    MasterToClient::ChunkLocations { handle, locations }
+                }
+                None => {
+                    tracing::warn!(chunk = handle, "chunk not found");
+                    MasterToClient::Error("chunk not found".into())
+                }
             }
         }
         ClientToMaster::AllocateChunk { filename } => {
             let locations = master.choose_locations(3).await;
             if locations.is_empty() {
+                tracing::error!(file = %filename, "no chunkservers available for allocation");
                 MasterToClient::Error("no chunkservers available".into())
             } else {
                 match master.add_chunk(&filename, locations).await {
                     Some(handle) => {
                         let locs = master.get_chunk_locations(handle).await.unwrap();
+                        tracing::info!(file = %filename, chunk = handle, replicas = ?locs, "allocated chunk");
                         MasterToClient::ChunkLocations {
                             handle,
                             locations: locs,
                         }
                     }
-                    None => MasterToClient::Error("file not found".into()),
+                    None => {
+                        tracing::warn!(file = %filename, "allocate chunk failed, file not found");
+                        MasterToClient::Error("file not found".into())
+                    }
                 }
             }
         }
         ClientToMaster::GetPrimary { handle } => match master.grant_lease(handle).await {
             Some((primary, secondaries, version, version_bumped)) => {
                 if version_bumped {
-                    // notify all replicas of the new version
+                    tracing::info!(
+                        chunk = handle,
+                        primary = %primary,
+                        version = version,
+                        secondaries = ?secondaries,
+                        "granted new lease, notifying replicas"
+                    );
                     let all_replicas: Vec<String> = std::iter::once(primary.clone())
                         .chain(secondaries.iter().cloned())
                         .collect();
@@ -78,15 +104,27 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                             let msg = MasterToChunkServer::UpdateVersion { handle, version };
                             let _ =
                                 send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                        } else {
+                            tracing::warn!(chunk = handle, replica = %addr, "failed to notify replica of version update");
                         }
                     }
+                } else {
+                    tracing::debug!(
+                        chunk = handle,
+                        primary = %primary,
+                        version = version,
+                        "reusing existing lease"
+                    );
                 }
                 MasterToClient::PrimaryInfo {
                     primary,
                     secondaries,
                 }
             }
-            None => MasterToClient::Error("chunk not found".into()),
+            None => {
+                tracing::warn!(chunk = handle, "grant lease failed, chunk not found");
+                MasterToClient::Error("chunk not found".into())
+            }
         },
     };
 
@@ -96,7 +134,10 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
 async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload: &[u8]) {
     let msg: ChunkServerToMaster = match decode_payload(payload) {
         Ok(m) => m,
-        Err(_) => return,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to decode chunkserver message");
+            return;
+        }
     };
 
     let response = match msg {
@@ -104,6 +145,11 @@ async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload
             addr,
             available_space,
         } => {
+            tracing::info!(
+                chunkserver = %addr,
+                available_mb = available_space / (1024 * 1024),
+                "chunkserver registered"
+            );
             master.register_chunkserver(addr, available_space).await;
             MasterToChunkServer::Ok
         }
@@ -112,8 +158,13 @@ async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload
             chunks,
             available_space,
         } => {
+            tracing::debug!(
+                chunkserver = %addr,
+                chunks = chunks.len(),
+                available_mb = available_space / (1024 * 1024),
+                "heartbeat"
+            );
             master.heartbeat(&addr, chunks, available_space).await;
-            // later: return DeleteChunks/ReplicateChunk instructions here
             MasterToChunkServer::Ok
         }
     };
@@ -123,28 +174,33 @@ async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
-    let master = Arc::new(Master::new(60)); //gfs uses 60 seconds as the default heartbeat timeout
+    let master = Arc::new(Master::new(60));
     let listener = match TcpListener::bind("0.0.0.0:5000").await {
         Ok(listener) => listener,
         Err(e) => {
-            eprintln!("Failed to bind to address: {}", e);
+            tracing::error!(error = %e, "failed to bind");
             return;
         }
     };
 
-    tracing::info!("Master server is running on 0.0.0.0:5000");
+    tracing::info!("master listening on 0.0.0.0:5000");
 
     loop {
         match listener.accept().await {
-            Ok((stream, addr)) => {
-                tracing::info!("New connection from {}", addr);
+            Ok((stream, _)) => {
                 let master_clone = Arc::clone(&master);
                 tokio::spawn(handle_connection(stream, master_clone));
             }
             Err(e) => {
-                eprintln!("Failed to accept connection: {}", e);
+                tracing::error!(error = %e, "accept failed");
             }
         }
     }

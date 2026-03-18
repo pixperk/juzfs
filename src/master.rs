@@ -64,9 +64,9 @@ impl Master {
 
         let info = ChunkInfo {
             handle,
-            version: 1,
+            version: 0,
             primary: None,
-            lease_expiry: Some(Instant::now() + self.expiry),
+            lease_expiry: None,
             locations: locations.clone(),
         };
 

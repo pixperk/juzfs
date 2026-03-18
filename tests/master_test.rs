@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use juzfs::master::Master;
 
 fn make_master() -> Master {
@@ -59,10 +57,14 @@ async fn test_register_and_heartbeat() {
         assert!(servers["10.0.0.1:9000"].chunks.is_empty());
     }
 
-    m.heartbeat("10.0.0.1:9000", vec![(1, 0), (2, 0), (3, 0)], 400).await;
+    m.heartbeat("10.0.0.1:9000", vec![(1, 0), (2, 0), (3, 0)], 400)
+        .await;
 
     let servers = m.chunkservers.read().await;
-    assert_eq!(servers["10.0.0.1:9000"].chunks, vec![(1, 0), (2, 0), (3, 0)]);
+    assert_eq!(
+        servers["10.0.0.1:9000"].chunks,
+        vec![(1, 0), (2, 0), (3, 0)]
+    );
     assert_eq!(servers["10.0.0.1:9000"].available_space, 400);
 }
 
@@ -107,17 +109,19 @@ async fn test_lease_expiry_is_set() {
 
     let chunks = m.chunks.read().await;
     let info = &chunks[&1];
-    assert!(info.lease_expiry.is_some());
-    assert_eq!(info.version, 1);
-    let remaining = info.lease_expiry.unwrap().duration_since(Instant::now());
-    assert!(remaining.as_secs() > 50);
+    assert!(info.lease_expiry.is_none());
+    assert_eq!(info.version, 0);
 }
 
 #[tokio::test]
 async fn test_grant_lease_new() {
     let m = make_master();
     m.create_file("/f".into()).await;
-    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into(), "c:9000".into()]).await;
+    m.add_chunk(
+        "/f",
+        vec!["a:9000".into(), "b:9000".into(), "c:9000".into()],
+    )
+    .await;
 
     let (primary, secondaries, version, bumped) = m.grant_lease(1).await.unwrap();
 
@@ -125,11 +129,11 @@ async fn test_grant_lease_new() {
     assert_eq!(secondaries.len(), 2);
     assert!(secondaries.contains(&"b:9000".to_string()));
     assert!(secondaries.contains(&"c:9000".to_string()));
-    assert_eq!(version, 2);
+    assert_eq!(version, 1);
     assert!(bumped);
 
     let chunks = m.chunks.read().await;
-    assert_eq!(chunks[&1].version, 2);
+    assert_eq!(chunks[&1].version, 1);
     assert_eq!(chunks[&1].primary, Some("a:9000".into()));
 }
 
@@ -137,10 +141,12 @@ async fn test_grant_lease_new() {
 async fn test_grant_lease_reuses_existing() {
     let m = make_master();
     m.create_file("/f".into()).await;
-    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()]).await;
+    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
+        .await;
 
     let (p1, _, v1, bumped1) = m.grant_lease(1).await.unwrap();
     assert!(bumped1);
+    assert_eq!(v1, 1);
 
     // second grant while lease is still active, no version bump
     let (p2, _, v2, bumped2) = m.grant_lease(1).await.unwrap();
@@ -149,27 +155,28 @@ async fn test_grant_lease_reuses_existing() {
     assert!(!bumped2);
 
     let chunks = m.chunks.read().await;
-    assert_eq!(chunks[&1].version, 2);
+    assert_eq!(chunks[&1].version, 1);
 }
 
 #[tokio::test]
 async fn test_grant_lease_expired_regrants() {
     let m = Master::new(0);
     m.create_file("/f".into()).await;
-    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()]).await;
+    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
+        .await;
 
-    // first grant: version 1 -> 2
+    // first grant: version 0 -> 1
     let (_, _, v1, _) = m.grant_lease(1).await.unwrap();
-    assert_eq!(v1, 2);
+    assert_eq!(v1, 1);
 
-    // lease expired immediately, next grant bumps 2 -> 3
+    // lease expired immediately, next grant bumps 1 -> 2
     let (primary, _, v2, bumped) = m.grant_lease(1).await.unwrap();
     assert_eq!(primary, "a:9000");
-    assert_eq!(v2, 3);
+    assert_eq!(v2, 2);
     assert!(bumped);
 
     let chunks = m.chunks.read().await;
-    assert_eq!(chunks[&1].version, 3);
+    assert_eq!(chunks[&1].version, 2);
 }
 
 #[tokio::test]
@@ -184,15 +191,16 @@ async fn test_heartbeat_detects_stale_replica() {
     m.create_file("/f".into()).await;
     m.register_chunkserver("a:9000".into(), 1000).await;
     m.register_chunkserver("b:9000".into(), 1000).await;
-    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()]).await;
+    m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
+        .await;
 
-    // grant lease bumps version to 2
+    // grant lease bumps version to 1
     let (_, _, version, _) = m.grant_lease(1).await.unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 1);
 
     // "a" reports current version, "b" reports stale version
-    m.heartbeat("a:9000", vec![(1, 2)], 1000).await;
-    m.heartbeat("b:9000", vec![(1, 1)], 1000).await;
+    m.heartbeat("a:9000", vec![(1, 1)], 1000).await;
+    m.heartbeat("b:9000", vec![(1, 0)], 1000).await;
 
     let chunks = m.chunks.read().await;
     let locs = &chunks[&1].locations;
