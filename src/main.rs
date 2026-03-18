@@ -9,7 +9,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  create <path>           create file and allocate first chunk");
-    eprintln!("  write  <path> <data>    write data at offset 0");
+    eprintln!("  write  <path> <offset> <data>");
     eprintln!("  read   <path> [off] [len]");
     eprintln!("  append <path> <data>    record append");
     eprintln!("  stream <path>           streaming read");
@@ -77,9 +77,10 @@ async fn cmd_create(client: &Client, args: &[String]) -> std::io::Result<()> {
 
 async fn cmd_write(client: &Client, args: &[String]) -> std::io::Result<()> {
     let path = args.first().unwrap_or_else(|| usage());
-    let data = args.get(1).unwrap_or_else(|| usage());
-    client.write(path, 0, data.as_bytes()).await?;
-    println!("{} bytes", data.len());
+    let offset: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
+    let data = args.get(2).unwrap_or_else(|| usage());
+    client.write(path, offset, data.as_bytes()).await?;
+    println!("{} bytes at offset {}", data.len(), offset);
     Ok(())
 }
 
