@@ -48,6 +48,7 @@ pub struct ChunkServer {
     data_dir: PathBuf,
     addr: String,
     capacity: u64,
+    chunk_size: u64,
     stored_chunks: RwLock<HashMap<ChunkHandle, u64>>,
     push_buffer: Mutex<LruCache<ChunkHandle, Vec<u8>>>,
     /// monotonically increasing serial number, only used when this CS acts as primary
@@ -56,15 +57,20 @@ pub struct ChunkServer {
 }
 
 impl ChunkServer {
-    pub fn new(data_dir: PathBuf, addr: String, capacity: u64) -> Self {
+    pub fn new(data_dir: PathBuf, addr: String, capacity: u64, chunk_size: u64) -> Self {
         Self {
             data_dir,
             addr,
             capacity,
+            chunk_size,
             stored_chunks: RwLock::new(HashMap::new()),
             push_buffer: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
             next_serial: AtomicU64::new(0),
         }
+    }
+
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size
     }
 
     fn chunk_path(&self, handle: ChunkHandle) -> PathBuf {

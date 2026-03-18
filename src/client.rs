@@ -77,6 +77,9 @@ impl Client {
     }
 
     pub async fn read(&self, filename: &str, offset: u64, length: u64) -> io::Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
         let metadata = self.get_chunk_metadata(filename).await?;
 
         let start_chunk = (offset / self.chunk_size) as usize;
@@ -191,6 +194,9 @@ impl Client {
     ///   1. push data through chunkserver chain (all replicas buffer it)
     ///   2. tell primary to commit (primary orders + forwards to secondaries)
     pub async fn write(&self, filename: &str, offset: u64, data: &[u8]) -> io::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let metadata = self.get_chunk_metadata(filename).await?;
 
         let start_chunk = (offset / self.chunk_size) as usize;

@@ -139,7 +139,7 @@ async fn handle_client_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[
             ChunkServerToClient::Ok
         }
         ClientToChunkServer::Append { handle, data, secondaries } => {
-            let max_chunk = juzfs::CHUNK_SIZE;
+            let max_chunk = cs.chunk_size();
             let current_size = cs.chunk_size_on_disk(handle).unwrap_or(0);
 
             if current_size + data.len() as u64 > max_chunk {
@@ -226,6 +226,7 @@ async fn handle_cs_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[u8])
             tracing::info!(chunk = handle, bytes = data.len(), remaining = remaining.len(), "forward data buffered");
             cs.buffer_push(handle, data.clone()).await;
 
+            let mut chain_err: Option<String> = None;
             if let Some((next, rest)) = remaining.split_first() {
                 tracing::debug!(chunk = handle, next = %next, "forwarding to next in chain");
                 let fwd = ChunkServerToChunkServer::ForwardData {
@@ -233,21 +234,40 @@ async fn handle_cs_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[u8])
                     data,
                     remaining: rest.to_vec(),
                 };
-                if let Ok(mut next_conn) = TcpStream::connect(next).await {
-                    let _ = send_frame(
-                        &mut next_conn,
-                        MessageType::ChunkServerToChunkServer,
-                        &fwd,
-                    )
-                    .await;
-                    let _: Result<(u8, ChunkServerAck), _> =
-                        juzfs::protocol::read_frame(&mut next_conn).await;
-                } else {
-                    tracing::error!(chunk = handle, next = %next, "failed to forward data");
+                match TcpStream::connect(next).await {
+                    Ok(mut next_conn) => {
+                        if let Err(e) = send_frame(
+                            &mut next_conn,
+                            MessageType::ChunkServerToChunkServer,
+                            &fwd,
+                        ).await {
+                            tracing::error!(chunk = handle, next = %next, error = %e, "forward send failed");
+                            chain_err = Some(format!("forward to {} failed: {}", next, e));
+                        } else {
+                            match juzfs::protocol::read_frame::<ChunkServerAck>(&mut next_conn).await {
+                                Ok((_, ChunkServerAck::Ok)) => {}
+                                Ok((_, ChunkServerAck::Error(e))) => {
+                                    tracing::error!(chunk = handle, next = %next, error = %e, "forward chain failed");
+                                    chain_err = Some(format!("chain forward {} failed: {}", next, e));
+                                }
+                                Err(e) => {
+                                    tracing::error!(chunk = handle, next = %next, error = %e, "forward ack failed");
+                                    chain_err = Some(format!("forward ack from {} failed: {}", next, e));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(chunk = handle, next = %next, error = %e, "failed to forward data");
+                        chain_err = Some(format!("forward to {} unreachable: {}", next, e));
+                    }
                 }
             }
 
-            ChunkServerAck::Ok
+            match chain_err {
+                Some(e) => ChunkServerAck::Error(e),
+                None => ChunkServerAck::Ok,
+            }
         }
         ChunkServerToChunkServer::CommitWrite { handle, serial } => {
             tracing::info!(chunk = handle, serial, "commit write (secondary)");
@@ -262,7 +282,7 @@ async fn handle_cs_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[u8])
         ChunkServerToChunkServer::CommitAppend { handle, data, offset, serial } => {
             if data.is_empty() {
                 tracing::info!(chunk = handle, "pad chunk (secondary)");
-                match cs.pad_chunk(handle, juzfs::CHUNK_SIZE).await {
+                match cs.pad_chunk(handle, cs.chunk_size()).await {
                     Ok(_) => ChunkServerAck::Ok,
                     Err(e) => {
                         tracing::error!(chunk = handle, error = %e, "pad failed");
@@ -336,7 +356,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes]");
+        eprintln!("usage: chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes] [chunk_size_bytes]");
         eprintln!("  e.g: chunkserver-node 127.0.0.1:6000 /tmp/cs1 127.0.0.1:5000");
         return;
     }
@@ -346,7 +366,8 @@ async fn main() {
     let master_addr = args[3].clone();
 
     let capacity: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1_000_000_000);
-    let cs = Arc::new(ChunkServer::new(data_dir.into(), addr.clone(), capacity));
+    let chunk_size: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(juzfs::CHUNK_SIZE);
+    let cs = Arc::new(ChunkServer::new(data_dir.into(), addr.clone(), capacity, chunk_size));
     if let Err(e) = cs.init().await {
         tracing::error!(error = %e, "failed to init chunkserver");
         return;

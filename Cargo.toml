@@ -2,6 +2,7 @@
 name = "juzfs"
 version = "0.1.0"
 edition = "2024"
+default-run = "juzfs"
 
 [[bin]]
 name = "master-server"
@@ -16,10 +17,8 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 lru = "0.16"
-thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
 crc32fast = "1"
 
 [dev-dependencies]
