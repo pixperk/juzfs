@@ -1,183 +1,206 @@
 # juzfs
 
-A distributed file system in Rust, based on the [Google File System paper](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf). Built from scratch with raw TCP and bincode serialization, no gRPC.
+A distributed file system in Rust, based on the [Google File System paper](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf). Built from scratch with raw TCP and bincode serialization. No gRPC, no protobuf.
 
-For a detailed breakdown of the GFS architecture that this project follows, see [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown).
+For a detailed breakdown of the GFS architecture, see [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown).
+
+## Why GFS
+
+GFS was built around assumptions that most filesystems ignore: files are huge, reads are sequential, writes are almost always appends, and disks fail constantly. Rather than fighting these realities with a general-purpose POSIX layer, Google designed around them. One master, big chunks, relaxed consistency for appends. juzfs takes this same approach and implements it in Rust with async I/O.
 
 ## Architecture
 
-juzfs follows the classic GFS three-component design: a single master server for metadata, multiple chunkservers for data, and a client library that coordinates between them.
-
 ![GFS Architecture](https://www.pixperk.tech/assets/blog/gfs-1.jpg)
 
-```mermaid
-graph TD
-    Client[Client CLI / Library]
-    Master[Master Server]
-    CS1[Chunkserver 1]
-    CS2[Chunkserver 2]
-    CS3[Chunkserver 3]
+Three components, all talking raw TCP:
 
-    Client -- metadata ops --> Master
-    Client -- data ops --> CS1
-    Client -- data ops --> CS2
-    Client -- data ops --> CS3
-    CS1 -- heartbeat --> Master
-    CS2 -- heartbeat --> Master
-    CS3 -- heartbeat --> Master
+### Master
+
+The single metadata server. Holds the file namespace (filenames to chunk handle lists), chunk metadata (version, primary lease, replica locations), and the state of every registered chunkserver. Everything lives in memory behind `RwLock`s. The master never sees file data. Clients ask it "where does this chunk live?", get an answer, and go talk to chunkservers directly. Keeping the master off the data path is the core scalability trick in GFS.
+
+Chunk locations are deliberately not persisted. On restart, the master knows nothing about which chunkserver holds what. As chunkservers boot and heartbeat in, they report their full chunk inventory with version numbers. The master rebuilds its location map from these reports. This is more robust than persisting locations because the chunkservers are always the ground truth about what's physically on their disks.
+
+### Chunkservers
+
+The data layer. Each chunkserver manages a local directory with three types of files per chunk:
+
+```
+chunks/00000001.chunk    -- raw data, up to 64MB
+checksums/00000001.csum  -- CRC32 per 64KB block, packed big-endian
+versions/00000001.ver    -- chunk version number
 ```
 
-**Master** holds all metadata in memory: file namespace, file-to-chunk mappings, chunk locations, and lease state. It never touches file data. Chunkservers report their chunk inventory via heartbeats, so the master never persists chunk locations and can rebuild them on restart.
+Chunks default to 64MB (configurable via CLI for testing). Every 64KB block gets a CRC32 checksum computed on write and verified on every read. A mismatch means corruption, and the read fails so the client can try another replica.
 
-**Chunkservers** store chunks as plain files on disk, each chunk being 64MB by default (configurable). Every 64KB block within a chunk is checksummed with CRC32 for integrity verification. On startup, a chunkserver scans its data directory to recover existing chunks.
+For writes, chunkservers maintain an LRU push buffer (32 entries). Data arrives in phase 1 of the write protocol and sits in memory until the primary triggers a commit in phase 2. A monotonic `AtomicU64` serial counter on the primary ensures all replicas apply mutations in identical order.
 
-**Client** is a library that caches metadata (with a 30-second staleness window) and talks directly to chunkservers for reads and writes. The master is only contacted for metadata, keeping it off the data path entirely.
+Every 5 seconds, each chunkserver heartbeats to the master with its chunk list (handles + versions) and real available disk space (calculated from actual file sizes, not hardcoded).
 
-## How Reads Work
+### Client
 
-A read goes through two steps: ask the master where the data lives, then fetch it directly from a chunkserver.
+A Rust library (`src/client.rs`) that handles all the protocol complexity. It caches chunk metadata locally with a 30-second staleness window to avoid redundant master lookups. The client manages the full read, write, and append flows, including transparent retry when a chunk fills up during record append.
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant M as Master
-    participant CS as Chunkserver
+## Protocol
 
-    C->>M: GetFileChunks("/data.txt")
-    M-->>C: [chunk handles]
-    C->>M: GetChunkLocations(handle)
-    M-->>C: [cs1, cs2, cs3]
-    C->>CS: Read(handle, offset, length)
-    CS-->>C: data bytes
+Custom TCP framing, length-prefixed:
+
+```
+[magic: 2B "JF"][version: 1B][msg_type: 1B][payload_len: 4B][payload]
 ```
 
-The client picks the closest (or first available) replica. If one fails, it tries the next. For streaming reads, chunks are fetched sequentially and piped through a buffered channel (4 chunks ahead) so the consumer can process data as it arrives.
+Magic bytes `0x4A 0x46` catch misframed connections immediately. The `msg_type` byte routes messages:
 
-## How Writes Work
+| msg_type | Direction |
+|----------|-----------|
+| 1 | Client to Master |
+| 2 | Master to Client |
+| 3 | ChunkServer to Master |
+| 4 | Master to ChunkServer |
+| 5 | Client to ChunkServer |
+| 6 | ChunkServer to Client |
+| 7 | ChunkServer to ChunkServer |
+| 8 | ChunkServer Ack |
 
-Writes use a two-phase protocol. Data flows through a pipeline of chunkservers first, then the primary coordinates the actual commit.
+Payloads are bincode v1. Each direction has its own serde enum, so extending the protocol is just adding a variant.
+
+## Reads
+
+The master is never on the read path. The client asks it for metadata once, then reads directly from chunkservers.
+
+1. `GetFileChunks` returns the ordered list of chunk handles for a file
+2. `GetChunkLocations` returns which chunkservers hold each chunk
+3. Client sends `Read { handle, offset, length }` directly to a chunkserver
+4. If that replica fails (network error, checksum mismatch), try the next one
+
+For multi-chunk reads, the client calculates which chunks the byte range spans and issues per-chunk reads with the correct local offsets. If the requested length exceeds what the chunk actually has, the chunkserver clamps it and returns what's available.
+
+**Streaming reads** pipe chunks through a tokio mpsc channel with a 4-chunk lookahead buffer. A background task fetches chunks in order and feeds them into the channel. The consumer processes data as it arrives without loading the entire file into memory.
+
+## Writes
+
+Writes separate data flow from control flow using a two-phase protocol. This is the most interesting part of the design.
 
 ![Write and Mutation Flow](https://www.pixperk.tech/assets/blog/gfs-4.jpg)
 
 ```mermaid
 sequenceDiagram
     participant C as Client
-    participant M as Master
-    participant P as Primary CS
-    participant S as Secondary CS
+    participant P as Primary
+    participant S1 as Secondary 1
+    participant S2 as Secondary 2
 
-    C->>M: GetPrimary(handle)
-    M-->>C: primary=CS1, secondaries=[CS2, CS3]
+    Note over C,S2: Phase 1 -- data pipeline
+    C->>P: ForwardData(handle, data, [S1, S2])
+    P->>S1: ForwardData(handle, data, [S2])
+    S1->>S2: ForwardData(handle, data, [])
 
-    Note over C,S: Phase 1: Push data through chain
-    C->>P: ForwardData(handle, data, [CS2, CS3])
-    P->>S: ForwardData(handle, data, [CS3])
-    S->>S: buffer data
-
-    Note over C,S: Phase 2: Primary commits and coordinates
-    C->>P: Write(handle, secondaries)
-    P->>P: assign serial, flush buffer
-    P->>S: CommitWrite(handle, serial)
-    S-->>P: Ack
+    Note over C,S2: Phase 2 -- primary coordinates commit
+    C->>P: Write(handle, [S1, S2])
+    P->>P: serial=next(), flush to disk
+    P->>S1: CommitWrite(handle, serial)
+    S1-->>P: ack
+    P->>S2: CommitWrite(handle, serial)
+    S2-->>P: ack
     P-->>C: Ok
 ```
 
-The primary assigns a monotonically increasing serial number to each mutation. This serial number is the global ordering that all replicas follow. Secondaries apply writes in serial order, which guarantees consistency across replicas.
+**Phase 1** pushes data through a chunkserver chain. The client sends to the first node, which buffers and forwards to the next, and so on. Data flows in a single network pass rather than the client uploading to each replica separately. All nodes buffer in memory (the LRU push buffer), nothing touches disk yet.
+
+**Phase 2** is where ordering happens. The client tells the primary to commit. The primary assigns a monotonic serial number, flushes its own buffer to disk, then sends `CommitWrite` to each secondary with that serial. Secondaries flush and ack. Only after all replicas confirm does the primary ack the client.
+
+The serial number is the consistency mechanism. Two concurrent writes to the same chunk get serialized by the primary. Every replica applies them in serial order, so they converge to identical state.
 
 ### Leases
 
-The master grants a 60-second lease to one chunkserver, making it the primary for a chunk. All writes for that chunk go through this primary during the lease period. If the lease expires, the master can grant a new one (possibly to a different chunkserver), bumping the chunk version number.
+Before any write, the client asks the master for a primary via `GetPrimary`. The master grants a 60-second lease to one chunkserver. The same lease is reused for all writes during that window. No round-trip to the master per write, just per lease period.
+
+When a lease expires and a new one is needed, the master bumps the chunk version, notifies all replicas via `UpdateVersion`, and returns the new primary. This version bump is how stale replicas get caught (more on that below).
 
 ## Record Append
 
-Record append is the bread and butter of GFS workloads. The client specifies only the data, and the primary picks the offset. This allows multiple clients to append concurrently to the same file without any external locking.
+The dominant write pattern in GFS. The client provides only data, no offset. The primary decides where to place it. Multiple clients can append concurrently to the same file without any coordination between them.
 
 ![Record Append](https://www.pixperk.tech/assets/blog/gfs-5.jpg)
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant M as Master
-    participant P as Primary CS
-    participant S as Secondary CS
+The flow:
 
-    C->>P: Append(handle, data, secondaries)
+1. Client finds the last chunk of the file and sends `Append { handle, data, secondaries }` to its primary
+2. Primary checks: does `current_size + data_len` fit within the chunk size?
+3. **Fits**: primary sets `offset = current_size`, appends locally, sends `CommitAppend` with the same offset and data to all secondaries. Returns `AppendOk { offset }` to the client.
+4. **Doesn't fit**: primary pads the chunk to exactly 64MB on all replicas and returns `RetryNewChunk`. The client allocates a new chunk via the master, invalidates its metadata cache, and retries. This loop is transparent to the caller.
 
-    alt data fits in current chunk
-        P->>P: offset = current_size, append locally
-        P->>S: CommitAppend(handle, data, offset, serial)
-        S-->>P: Ack
-        P-->>C: AppendOk(offset)
-    else chunk is full
-        P->>P: pad chunk to 64MB
-        P->>S: pad chunk
-        P-->>C: RetryNewChunk
-        C->>M: AllocateChunk(filename)
-        M-->>C: new chunk handle
-        Note over C: retry append on new chunk
-    end
-```
+The padding matters. Without it, a half-full chunk on one replica could accept a conflicting append from a different client, breaking cross-replica consistency. Padding seals the chunk on all replicas simultaneously.
 
-When the current chunk cannot fit the data, the primary pads it to the full chunk size on all replicas and tells the client to allocate a new chunk and retry. The padding ensures no replica has a partially filled chunk that could accept conflicting appends.
+## Chunk Versioning
 
-## Protocol
+Every chunk starts at version 0. The version increments each time the master grants a new lease for that chunk. This is how the system detects replicas that missed mutations while they were down.
 
-All communication uses a custom TCP framing protocol with length-prefixed messages:
+The version lives in three places:
+- **Master memory**: `ChunkInfo.version`, the authoritative value
+- **Chunkserver disk**: `.ver` file per chunk, survives restarts
+- **Chunkserver memory**: `HashMap<ChunkHandle, u64>`, loaded from disk on init
 
-```
-[magic: 2B][version: 1B][msg_type: 1B][payload_len: 4B][payload: N bytes]
-```
+When the master grants a lease and bumps the version, it connects to every replica and sends `UpdateVersion { handle, version }`. Each chunkserver persists the new version to its `.ver` file.
 
-- Magic bytes: `0x4A 0x46` ("JF")
-- Version: `0x01`
-- Message types distinguish between client-master, client-chunkserver, and chunkserver-chunkserver traffic
-- Payload is serialized with bincode v1
+On heartbeat, each chunkserver reports `(handle, version)` pairs. The master compares:
+- **Version matches or ahead**: healthy replica, stays in the location list
+- **Version behind**: stale replica, removed from locations
+
+Once removed, the stale chunkserver is invisible to clients. No reads or writes will be directed to it. This happens automatically, no manual intervention.
 
 ## Data Integrity
 
-Each chunk on disk is stored as raw data followed by CRC32 checksums. Every 64KB block gets its own checksum. On read, the chunkserver recomputes the checksum and compares it against the stored value. A mismatch means corruption, and the read fails so the client can try another replica.
+![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
+
+Every read goes through checksum verification:
+
+1. Chunkserver reads the full chunk data from disk
+2. Reads the stored CRC32 checksums (one per 64KB block)
+3. Recomputes checksums from the data
+4. Compares block by block
+
+Any mismatch fails the read. The client then tries another replica. This catches silent disk corruption, partial writes, and bit rot without any external scrubbing process.
+
+## Heartbeats
+
+The heartbeat is the master's lifeline to the cluster. It serves three purposes:
+
+1. **Liveness**: the master knows which chunkservers are up based on heartbeat timestamps
+2. **Location rebuild**: chunk locations are reconstructed entirely from heartbeat reports, not persisted
+3. **Stale detection**: version numbers in heartbeats let the master identify and exclude stale replicas
+
+The cycle:
+- On boot, a chunkserver sends `Register { addr, available_space }`
+- Every 5 seconds after, it sends `Heartbeat { addr, chunks: Vec<(handle, version)>, available_space }`
+- Available space is real: `capacity - sum(chunk file sizes on disk)`
+- The master uses available space for placement decisions, preferring chunkservers with the most room
 
 ## Usage
 
-Start the master and a few chunkservers, then use the CLI to interact.
+Start the cluster in separate terminals:
 
 ```bash
-# terminal 1: master
+# master
 cargo run --bin master-server
 
-# terminal 2: chunkserver
+# three chunkservers
 cargo run --bin chunkserver-node -- 127.0.0.1:6001 /tmp/cs1 127.0.0.1:5000
-
-# terminal 3: another chunkserver
 cargo run --bin chunkserver-node -- 127.0.0.1:6002 /tmp/cs2 127.0.0.1:5000
-
-# terminal 4: another chunkserver
 cargo run --bin chunkserver-node -- 127.0.0.1:6003 /tmp/cs3 127.0.0.1:5000
 ```
 
 Then use the CLI:
 
 ```bash
-# create a file (also allocates first chunk)
 cargo run --bin juzfs -- create /hello.txt
-
-# write data
 cargo run --bin juzfs -- write /hello.txt 0 "the quick brown fox"
-
-# read it back
 cargo run --bin juzfs -- read /hello.txt
-
-# read with offset and length
 cargo run --bin juzfs -- read /hello.txt 4 5
-
-# record append
 cargo run --bin juzfs -- append /hello.txt "another line"
-
-# streaming read
 cargo run --bin juzfs -- stream /hello.txt
 ```
 
-### CLI Options
+### CLI
 
 ```
 juzfs [options] <command> [args]
@@ -187,37 +210,57 @@ options:
   --chunk-size <bytes>   chunk size in bytes (default: 64MB)
 
 commands:
-  create <path>              create file and allocate first chunk
+  create <path>                create file and allocate first chunk
   write  <path> <offset> <data>
   read   <path> [offset] [length]
-  append <path> <data>       record append
-  stream <path>              streaming read
+  append <path> <data>         record append
+  stream <path>                streaming read
 ```
 
-## What is Implemented
+### Chunkserver
 
-- [x] Single master with in-memory metadata (file namespace, chunk mappings, leases)
-- [x] Multiple chunkservers with disk persistence and CRC32 checksums
-- [x] Custom TCP protocol with bincode serialization
-- [x] Two-phase writes (push data through chain, then primary commits)
-- [x] Serial mutation ordering via monotonic counters on the primary
-- [x] Record append with automatic chunk overflow and retry
-- [x] 60-second lease mechanism for write coordination
-- [x] Chunkserver heartbeats with chunk location rebuild
-- [x] Client metadata caching with 30-second staleness check
-- [x] Streaming reads via buffered async channels
-- [x] Chunkserver disk recovery on restart
-- [x] CLI client
+```
+chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes]
+```
 
-## What is Left
+`capacity_bytes` defaults to 1GB. Available space in heartbeats is `capacity - actual disk usage`.
 
-- [ ] Master operation log (oplog) for crash recovery
-- [ ] Re-replication and rebalancing
-- [ ] Garbage collection (lazy delete via heartbeat)
-- [ ] Copy-on-write snapshots
-- [ ] Chunk version numbers and stale replica detection
+### Logging
+
+Structured logging via `tracing`. Control with `RUST_LOG`:
+
+```bash
+RUST_LOG=info cargo run --bin master-server    # default: file ops, leases, registrations
+RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavior
+```
+
+## Implemented
+
+- Single master, in-memory metadata (namespace, chunks, leases)
+- Chunkservers with disk persistence, CRC32 checksums per 64KB block, version tracking
+- Custom TCP protocol with magic bytes and bincode serialization
+- Two-phase writes: pipelined data push, then primary-coordinated commit
+- Mutation ordering via monotonic serial numbers on the primary
+- Record append with chunk overflow detection, padding, and transparent retry
+- 60-second write leases with version bump on renewal
+- Stale replica detection via version comparison on heartbeat
+- Master notifies replicas of version updates on lease grant
+- Location rebuild from heartbeats (no persisted chunk locations)
+- Available space tracking from real disk usage
+- Client metadata caching (30s staleness window)
+- Streaming reads with 4-chunk async buffer
+- Chunkserver recovery on restart (scans chunks, checksums, versions)
+- CLI client
+
+## Remaining
+
+- Master operation log (oplog) for crash recovery
+- Re-replication for under-replicated chunks
+- Chunk rebalancing across chunkservers
+- Garbage collection (lazy delete, heartbeat-driven cleanup)
+- Copy-on-write snapshots
 
 ## References
 
-- [The Google File System (2003)](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) - original paper by Ghemawat, Gobioff, and Leung
-- [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown) - blog post this implementation follows
+- [The Google File System (2003)](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) -- Ghemawat, Gobioff, and Leung
+- [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown) -- blog this implementation follows
