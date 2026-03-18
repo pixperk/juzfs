@@ -8,11 +8,12 @@ use crate::master::ChunkHandle;
 pub enum ChunkServerToMaster {
     /// first contact: chunkserver announces itself and how much disk it has
     Register { addr: String, available_space: u64 },
-    /// periodic heartbeat: reports liveness and which chunks it holds
+    /// periodic heartbeat: reports liveness and which chunks it holds with their versions
     /// master uses this to update its in-memory chunk location map
+    /// and detect stale replicas via version mismatch
     Heartbeat {
         addr: String,
-        chunks: Vec<ChunkHandle>,
+        chunks: Vec<(ChunkHandle, u64)>,
         available_space: u64,
     },
 }
@@ -23,6 +24,8 @@ pub enum ChunkServerToMaster {
 pub enum MasterToChunkServer {
     /// nothing to do, carry on
     Ok,
+    /// lease granted: update your local version for this chunk
+    UpdateVersion { handle: ChunkHandle, version: u64 },
     /// garbage collection: these chunks are orphaned, delete them
     DeleteChunks(Vec<ChunkHandle>),
     /// replication: copy this chunk to another chunkserver

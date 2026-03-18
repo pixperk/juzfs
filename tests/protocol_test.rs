@@ -165,7 +165,7 @@ async fn test_heartbeat_roundtrip() {
         let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
         let msg = ChunkServerToMaster::Heartbeat {
             addr: "10.0.0.5:9000".into(),
-            chunks: vec![1, 2, 3, 4, 5],
+            chunks: vec![(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)],
             available_space: 999_000,
         };
         send_frame(&mut stream, MessageType::ChunkServerToMaster, &msg)
@@ -185,7 +185,7 @@ async fn test_heartbeat_roundtrip() {
             available_space,
         } => {
             assert_eq!(addr, "10.0.0.5:9000");
-            assert_eq!(chunks, vec![1, 2, 3, 4, 5]);
+            assert_eq!(chunks, vec![(1, 0), (2, 0), (3, 0), (4, 0), (5, 0)]);
             assert_eq!(available_space, 999_000);
         }
         _ => panic!("wrong variant"),

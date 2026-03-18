@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs, io,
     num::NonZeroUsize,
     path::PathBuf,
@@ -48,7 +48,7 @@ pub struct ChunkServer {
     data_dir: PathBuf,
     addr: String,
     capacity: u64,
-    stored_chunks: RwLock<HashSet<ChunkHandle>>,
+    stored_chunks: RwLock<HashMap<ChunkHandle, u64>>,
     push_buffer: Mutex<LruCache<ChunkHandle, Vec<u8>>>,
     /// monotonically increasing serial number, only used when this CS acts as primary
     /// ensures all replicas apply mutations in the same order
@@ -61,7 +61,7 @@ impl ChunkServer {
             data_dir,
             addr,
             capacity,
-            stored_chunks: RwLock::new(HashSet::new()),
+            stored_chunks: RwLock::new(HashMap::new()),
             push_buffer: Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())),
             next_serial: AtomicU64::new(0),
         }
@@ -79,17 +79,36 @@ impl ChunkServer {
             .join(format!("{:08x}.csum", handle))
     }
 
+    fn version_path(&self, handle: ChunkHandle) -> PathBuf {
+        self.data_dir
+            .join("versions")
+            .join(format!("{:08x}.ver", handle))
+    }
+
+    fn read_version_from_disk(&self, handle: ChunkHandle) -> u64 {
+        fs::read_to_string(self.version_path(handle))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn write_version_to_disk(&self, handle: ChunkHandle, version: u64) -> io::Result<()> {
+        fs::write(self.version_path(handle), version.to_string())
+    }
+
     pub async fn init(&self) -> io::Result<()> {
         fs::create_dir_all(self.data_dir.join("chunks"))?;
         fs::create_dir_all(self.data_dir.join("checksums"))?;
+        fs::create_dir_all(self.data_dir.join("versions"))?;
 
-        // recover: scan existing chunk files into stored_chunks
+        // recover: scan existing chunk files, load versions from disk
         let mut stored = self.stored_chunks.write().await;
         for entry in fs::read_dir(self.data_dir.join("chunks"))? {
             let entry = entry?;
             if let Some(name) = entry.path().file_stem().and_then(|s| s.to_str()) {
                 if let Ok(handle) = u64::from_str_radix(name, 16) {
-                    stored.insert(handle);
+                    let version = self.read_version_from_disk(handle);
+                    stored.insert(handle, version);
                 }
             }
         }
@@ -98,7 +117,7 @@ impl ChunkServer {
 
     pub async fn has_chunk(&self, handle: ChunkHandle) -> bool {
         let stored = self.stored_chunks.read().await;
-        stored.contains(&handle)
+        stored.contains_key(&handle)
     }
 
     pub async fn store_chunk(&self, handle: ChunkHandle, data: Vec<u8>) -> io::Result<()> {
@@ -112,9 +131,12 @@ impl ChunkServer {
         let checksums = compute_checksums(&data);
         fs::write(&checksum_path, checksums_to_bytes(&checksums))?;
 
-        // update in-memory state
+        // preserve existing version, default to 0 for new chunks
         let mut stored = self.stored_chunks.write().await;
-        stored.insert(handle);
+        if !stored.contains_key(&handle) {
+            self.write_version_to_disk(handle, 0)?;
+            stored.insert(handle, 0);
+        }
 
         Ok(())
     }
@@ -184,7 +206,12 @@ impl ChunkServer {
     /// append data to an existing chunk at a specific offset
     /// rewrites the full file (read + append + rewrite checksums)
     /// all replicas must append at the same offset for consistency
-    pub async fn append_to_chunk(&self, handle: ChunkHandle, data: &[u8], offset: u64) -> io::Result<()> {
+    pub async fn append_to_chunk(
+        &self,
+        handle: ChunkHandle,
+        data: &[u8],
+        offset: u64,
+    ) -> io::Result<()> {
         let chunk_path = self.chunk_path(handle);
         let checksum_path = self.checksum_path(handle);
 
@@ -210,12 +237,15 @@ impl ChunkServer {
         fs::write(&checksum_path, checksums_to_bytes(&checksums))?;
 
         let mut stored = self.stored_chunks.write().await;
-        stored.insert(handle);
+        if !stored.contains_key(&handle) {
+            self.write_version_to_disk(handle, 0)?;
+            stored.insert(handle, 0);
+        }
 
         Ok(())
     }
 
-    /// pad a chunk to exactly 64MB (used when append doesn't fit, before moving to next chunk)
+    /// pad a chunk to exactly max_chunk_size (used when append doesn't fit, before moving to next chunk)
     pub async fn pad_chunk(&self, handle: ChunkHandle, max_chunk_size: u64) -> io::Result<()> {
         let chunk_path = self.chunk_path(handle);
         let checksum_path = self.checksum_path(handle);
@@ -231,11 +261,9 @@ impl ChunkServer {
     }
 
     pub async fn delete_chunk(&self, handle: ChunkHandle) -> io::Result<()> {
-        let chunk_path = self.chunk_path(handle);
-        let checksum_path = self.checksum_path(handle);
-
-        fs::remove_file(&chunk_path)?;
-        fs::remove_file(&checksum_path)?;
+        fs::remove_file(self.chunk_path(handle))?;
+        fs::remove_file(self.checksum_path(handle))?;
+        let _ = fs::remove_file(self.version_path(handle));
 
         let mut stored = self.stored_chunks.write().await;
         stored.remove(&handle);
@@ -243,8 +271,30 @@ impl ChunkServer {
         Ok(())
     }
 
-    pub async fn list_chunks(&self) -> Vec<ChunkHandle> {
-        self.stored_chunks.read().await.iter().copied().collect()
+    /// returns (handle, version) for each stored chunk
+    pub async fn list_chunks(&self) -> Vec<(ChunkHandle, u64)> {
+        self.stored_chunks
+            .read()
+            .await
+            .iter()
+            .map(|(&h, &v)| (h, v))
+            .collect()
+    }
+
+    /// master calls this when granting a new lease to bump the version
+    /// persists to disk so version survives restarts
+    pub async fn update_version(&self, handle: ChunkHandle, version: u64) -> io::Result<()> {
+        self.write_version_to_disk(handle, version)?;
+        let mut stored = self.stored_chunks.write().await;
+        if let Some(v) = stored.get_mut(&handle) {
+            *v = version;
+        }
+        Ok(())
+    }
+
+    /// get the local version for a chunk
+    pub async fn get_version(&self, handle: ChunkHandle) -> Option<u64> {
+        self.stored_chunks.read().await.get(&handle).copied()
     }
 
     /// assign next serial number (only meaningful when acting as primary)

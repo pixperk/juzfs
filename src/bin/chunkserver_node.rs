@@ -15,6 +15,8 @@ async fn handle_connection(mut stream: TcpStream, cs: Arc<ChunkServer>) {
         };
 
         match msg_type {
+            // 4 = MasterToChunkServer (version updates, gc instructions)
+            4 => handle_master_msg(&cs, &payload).await,
             // 5 = ClientToChunkServer
             5 => handle_client_msg(&mut stream, &cs, &payload).await,
             // 7 = ChunkServerToChunkServer (data pipeline forwarding)
@@ -24,6 +26,27 @@ async fn handle_connection(mut stream: TcpStream, cs: Arc<ChunkServer>) {
                 break;
             }
         }
+    }
+}
+
+async fn handle_master_msg(cs: &ChunkServer, payload: &[u8]) {
+    let msg: MasterToChunkServer = match decode_payload(payload) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    match msg {
+        MasterToChunkServer::UpdateVersion { handle, version } => {
+            if let Err(e) = cs.update_version(handle, version).await {
+                tracing::warn!("failed to update version for chunk {}: {}", handle, e);
+            }
+        }
+        MasterToChunkServer::DeleteChunks(handles) => {
+            for h in handles {
+                let _ = cs.delete_chunk(h).await;
+            }
+        }
+        _ => {}
     }
 }
 

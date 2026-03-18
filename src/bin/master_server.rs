@@ -67,10 +67,25 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
             }
         }
         ClientToMaster::GetPrimary { handle } => match master.grant_lease(handle).await {
-            Some((primary, secondaries)) => MasterToClient::PrimaryInfo {
-                primary,
-                secondaries,
-            },
+            Some((primary, secondaries, version, version_bumped)) => {
+                if version_bumped {
+                    // notify all replicas of the new version
+                    let all_replicas: Vec<String> = std::iter::once(primary.clone())
+                        .chain(secondaries.iter().cloned())
+                        .collect();
+                    for addr in &all_replicas {
+                        if let Ok(mut conn) = TcpStream::connect(addr).await {
+                            let msg = MasterToChunkServer::UpdateVersion { handle, version };
+                            let _ =
+                                send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                        }
+                    }
+                }
+                MasterToClient::PrimaryInfo {
+                    primary,
+                    secondaries,
+                }
+            }
             None => MasterToClient::Error("chunk not found".into()),
         },
     };

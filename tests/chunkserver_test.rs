@@ -40,7 +40,12 @@ async fn test_read_out_of_bounds() {
 
     cs.store_chunk(1, b"short".to_vec()).await.unwrap();
 
-    let err = cs.read_chunk(1, 0, 100).await;
+    // length past end gets clamped, returns available data
+    let result = cs.read_chunk(1, 0, 100).await.unwrap();
+    assert_eq!(result, b"short".to_vec());
+
+    // offset past end is an error
+    let err = cs.read_chunk(1, 100, 5).await;
     assert!(err.is_err());
     assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
 }
@@ -117,7 +122,7 @@ async fn test_list_chunks() {
 
     let mut chunks = cs.list_chunks().await;
     chunks.sort();
-    assert_eq!(chunks, vec![10, 20, 30]);
+    assert_eq!(chunks, vec![(10, 0), (20, 0), (30, 0)]);
 }
 
 #[tokio::test]
@@ -138,7 +143,23 @@ async fn test_init_recovers_existing_chunks() {
 
     let mut chunks = cs2.list_chunks().await;
     chunks.sort();
-    assert_eq!(chunks, vec![1, 2]);
+    assert_eq!(chunks, vec![(1, 0), (2, 0)]);
+}
+
+#[tokio::test]
+async fn test_update_version() {
+    let dir = tempdir().unwrap();
+    let cs = make_chunkserver(dir.path()).await;
+
+    cs.store_chunk(1, b"data".to_vec()).await.unwrap();
+    assert_eq!(cs.get_version(1).await, Some(0));
+
+    cs.update_version(1, 5).await.unwrap();
+    assert_eq!(cs.get_version(1).await, Some(5));
+
+    // version persists across restarts
+    let cs2 = make_chunkserver(dir.path()).await;
+    assert_eq!(cs2.get_version(1).await, Some(5));
 }
 
 #[tokio::test]

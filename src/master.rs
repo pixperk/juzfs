@@ -17,8 +17,8 @@ pub struct ChunkInfo {
 pub struct ChunkServerState {
     pub addr: String,
     pub last_heartbeat: Instant,
-    pub chunks: Vec<ChunkHandle>, // chunks this server reports holding
-    pub available_space: u64,     // bytes, for placement decisions
+    pub chunks: Vec<(ChunkHandle, u64)>, // (handle, version) pairs reported by this server
+    pub available_space: u64,
 }
 
 pub struct Master {
@@ -102,9 +102,10 @@ impl Master {
         );
     }
 
-    /// stores the last heartbeat instance for a chunkserver and the chunks it reports holding.
-    /// this is used to detect failed chunkservers and update chunk locations.
-    pub async fn heartbeat(&self, addr: &str, chunks: Vec<ChunkHandle>, available_space: u64) {
+    /// processes heartbeat from a chunkserver, rebuilds chunk locations,
+    /// and detects stale replicas by comparing reported version against master's version.
+    /// stale replicas are not added to locations, so clients never get sent to them.
+    pub async fn heartbeat(&self, addr: &str, chunks: Vec<(ChunkHandle, u64)>, available_space: u64) {
         let mut servers = self.chunkservers.write().await;
         if let Some(server) = servers.get_mut(addr) {
             server.last_heartbeat = Instant::now();
@@ -113,13 +114,18 @@ impl Master {
         }
         drop(servers);
 
-        // rebuild chunk locations from heartbeat
-        // this is how master recovers location data on cold start
         let mut chunk_map = self.chunks.write().await;
-        for handle in &chunks {
+        for (handle, reported_version) in &chunks {
             if let Some(info) = chunk_map.get_mut(handle) {
-                if !info.locations.contains(&addr.to_string()) {
-                    info.locations.push(addr.to_string());
+                if *reported_version >= info.version {
+                    // version matches or is ahead, add to locations
+                    if !info.locations.contains(&addr.to_string()) {
+                        info.locations.push(addr.to_string());
+                    }
+                } else {
+                    // stale replica: reported version is behind master's version
+                    // remove from locations so clients won't read from it
+                    info.locations.retain(|l| l != addr);
                 }
             }
         }
@@ -137,9 +143,11 @@ impl Master {
             .collect()
     }
 
-    ///grants lease to a chunkserver and returns the primary and secondaries for a chunk.
-    /// this is used when a client wants to write to a chunk and needs to know which chunkserver has the write lease (primary) and which ones hold replicas (secondaries).
-    pub async fn grant_lease(&self, handle: ChunkHandle) -> Option<(String, Vec<String>)> {
+    /// grants lease to a chunkserver and returns (primary, secondaries, version, version_bumped).
+    /// version_bumped is true when a new lease was granted (version incremented),
+    /// meaning the caller should notify all replicas to update their version.
+    /// when reusing an existing lease, version_bumped is false.
+    pub async fn grant_lease(&self, handle: ChunkHandle) -> Option<(String, Vec<String>, u64, bool)> {
         let mut chunks = self.chunks.write().await;
         let info = chunks.get_mut(&handle)?;
 
@@ -152,7 +160,7 @@ impl Master {
                     .filter(|l| *l != primary)
                     .cloned()
                     .collect();
-                return Some((primary.clone(), secondaries));
+                return Some((primary.clone(), secondaries, info.version, false));
             }
         }
 
@@ -162,6 +170,7 @@ impl Master {
         info.version += 1;
         info.lease_expiry = Some(Instant::now() + self.expiry);
 
+        let version = info.version;
         let secondaries = info
             .locations
             .iter()
@@ -169,6 +178,6 @@ impl Master {
             .cloned()
             .collect();
 
-        Some((primary, secondaries))
+        Some((primary, secondaries, version, true))
     }
 }
