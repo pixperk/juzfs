@@ -378,12 +378,13 @@ impl Master {
     /// processes heartbeat from a chunkserver, rebuilds chunk locations,
     /// and detects stale replicas by comparing reported version against master's version.
     /// stale replicas are not added to locations, so clients never get sent to them.
+    /// returns list of orphaned chunk handles the chunkserver should delete.
     pub async fn heartbeat(
         &self,
         addr: &str,
         chunks: Vec<(ChunkHandle, u64)>,
         available_space: u64,
-    ) {
+    ) -> Vec<ChunkHandle> {
         let mut servers = self.chunkservers.write().await;
         if let Some(server) = servers.get_mut(addr) {
             server.last_heartbeat = Instant::now();
@@ -393,6 +394,7 @@ impl Master {
         drop(servers);
 
         let mut chunk_map = self.chunks.write().await;
+        let mut orphaned = Vec::new();
         for (handle, reported_version) in &chunks {
             if let Some(info) = chunk_map.get_mut(handle) {
                 if *reported_version >= info.version {
@@ -405,8 +407,12 @@ impl Master {
                     // remove from locations so clients won't read from it
                     info.locations.retain(|l| l != addr);
                 }
+            } else {
+                // master doesn't know this chunk — it's orphaned
+                orphaned.push(*handle);
             }
         }
+        orphaned
     }
 
     ///picks a certain number (replication_factor) of chunkservers with most available space for new chunk placement
@@ -528,5 +534,48 @@ impl Master {
         });
 
         Ok(())
+    }
+
+    /// sweep deleted files past the retention window.
+    /// removes their chunks from metadata and the hidden file entry.
+    /// returns orphaned chunk handles (for step 3: telling chunkservers to delete them).
+    pub async fn gc_sweep(&self, retention_secs: u64) -> Vec<ChunkHandle> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut deleted = self.deleted_files.write().await;
+        let expired: Vec<_> = deleted
+            .iter()
+            .filter(|(_, (_, ts))| now - ts >= retention_secs)
+            .map(|(hidden, (orig, _))| (hidden.clone(), orig.clone()))
+            .collect();
+
+        if expired.is_empty() {
+            return Vec::new();
+        }
+
+        let mut files = self.files.write().await;
+        let mut chunks = self.chunks.write().await;
+        let mut orphaned_chunks = Vec::new();
+
+        for (hidden_name, _original) in &expired {
+            if let Some(handles) = files.remove(hidden_name) {
+                for h in handles {
+                    chunks.remove(&h);
+                    orphaned_chunks.push(h);
+                }
+            }
+            deleted.remove(hidden_name);
+        }
+
+        tracing::info!(
+            expired_files = expired.len(),
+            orphaned_chunks = orphaned_chunks.len(),
+            "gc sweep complete"
+        );
+
+        orphaned_chunks
     }
 }

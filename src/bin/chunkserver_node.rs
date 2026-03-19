@@ -336,8 +336,14 @@ async fn heartbeat_loop(cs: Arc<ChunkServer>, master_addr: String) {
                 available_space: cs.available_space(),
             };
             let _ = send_frame(&mut conn, MessageType::ChunkServerToMaster, &hb).await;
-            let _: Result<(u8, MasterToChunkServer), _> =
-                juzfs::protocol::read_frame(&mut conn).await;
+            match juzfs::protocol::read_raw_frame(&mut conn).await {
+                Ok((_msg_type, payload)) => {
+                    handle_master_msg(&cs, &payload).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to read heartbeat response");
+                }
+            }
         } else {
             tracing::warn!(master = %master_addr, "heartbeat failed, master unreachable");
         }

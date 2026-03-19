@@ -191,8 +191,13 @@ async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload
                 available_mb = available_space / (1024 * 1024),
                 "heartbeat"
             );
-            master.heartbeat(&addr, chunks, available_space).await;
-            MasterToChunkServer::Ok
+            let orphaned = master.heartbeat(&addr, chunks, available_space).await;
+            if orphaned.is_empty() {
+                MasterToChunkServer::Ok
+            } else {
+                tracing::info!(chunkserver = %addr, chunks = ?orphaned, "gc: telling chunkserver to delete orphaned chunks");
+                MasterToChunkServer::DeleteChunks(orphaned)
+            }
         }
     };
 
@@ -220,6 +225,19 @@ async fn main() {
     };
 
     tracing::info!("master listening on 0.0.0.0:5000");
+
+    // background GC: sweep expired deleted files every 60s, 5 min retention
+    let gc_master = Arc::clone(&master);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let orphaned = gc_master.gc_sweep(300).await;
+            if !orphaned.is_empty() {
+                tracing::info!(chunks = ?orphaned, "gc: orphaned chunks ready for chunkserver cleanup");
+            }
+        }
+    });
 
     loop {
         match listener.accept().await {

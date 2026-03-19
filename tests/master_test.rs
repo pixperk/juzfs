@@ -298,7 +298,7 @@ async fn test_checkpoint_and_recovery() {
         assert!(checkpoint_path.exists(), "checkpoint.bin should exist after 100 ops");
 
         // oplog.old.bin should be cleaned up by background task
-        let old_path = oplog_path.with_extension("old.bin");
+        let _old_path = oplog_path.with_extension("old.bin");
         // might still exist briefly, but checkpoint should be written
     }
 
@@ -368,6 +368,75 @@ async fn test_checkpoint_with_post_checkpoint_ops() {
     assert_eq!(chunks[&1].version, 1);
 }
 
+#[tokio::test]
+async fn test_delete_file_lazy() {
+    let m = make_master();
+    m.create_file("/gc_me.txt".into()).await.unwrap();
+    m.add_chunk("/gc_me.txt", vec!["cs:9000".into()]).await.unwrap();
+
+    // file exists before delete
+    assert!(m.get_file_chunks("/gc_me.txt").await.is_some());
+
+    // lazy delete
+    assert!(m.delete_file("/gc_me.txt".into()).await.unwrap());
+
+    // original name gone, hidden name exists
+    assert!(m.get_file_chunks("/gc_me.txt").await.is_none());
+    assert!(m.get_file_chunks("/.deleted_gc_me.txt").await.is_some());
+
+    // deleted_files map has the entry
+    let deleted = m.deleted_files.read().await;
+    assert!(deleted.contains_key("/.deleted_gc_me.txt"));
+}
+
+#[tokio::test]
+async fn test_gc_sweep_before_retention() {
+    let m = make_master();
+    m.create_file("/gc_me.txt".into()).await.unwrap();
+    m.add_chunk("/gc_me.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.delete_file("/gc_me.txt".into()).await.unwrap();
+
+    // sweep with 300s retention -- file was just deleted, should NOT be reaped
+    let orphaned = m.gc_sweep(300).await;
+    assert!(orphaned.is_empty());
+
+    // hidden file should still exist
+    assert!(m.get_file_chunks("/.deleted_gc_me.txt").await.is_some());
+}
+
+#[tokio::test]
+async fn test_gc_sweep_after_retention() {
+    let m = make_master();
+    m.create_file("/gc_me.txt".into()).await.unwrap();
+    let handle = m.add_chunk("/gc_me.txt", vec!["cs:9000".into()]).await.unwrap().unwrap();
+    m.delete_file("/gc_me.txt".into()).await.unwrap();
+
+    // manually backdate the deletion timestamp so it looks expired
+    {
+        let mut deleted = m.deleted_files.write().await;
+        if let Some(entry) = deleted.get_mut("/.deleted_gc_me.txt") {
+            entry.1 = entry.1.saturating_sub(600); // pretend deleted 10 min ago
+        }
+    }
+
+    // sweep with 300s retention -- should reap
+    let orphaned = m.gc_sweep(300).await;
+    assert_eq!(orphaned, vec![handle]);
+
+    // hidden file and chunk metadata should be gone
+    assert!(m.get_file_chunks("/.deleted_gc_me.txt").await.is_none());
+    assert!(m.get_chunk_locations(handle).await.is_none());
+
+    // deleted_files map should be empty
+    assert!(m.deleted_files.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_nonexistent_file() {
+    let m = make_master();
+    assert!(!m.delete_file("/nope.txt".into()).await.unwrap());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_crash_between_rotate_and_checkpoint() {
     let dir = tempdir().unwrap();
@@ -393,7 +462,7 @@ async fn test_crash_between_rotate_and_checkpoint() {
 
     // simulate crash before checkpoint finished: delete checkpoint, keep old log
     let checkpoint_path = dir.path().join("checkpoint.bin");
-    let old_oplog = oplog_path.with_extension("old.bin");
+    let _old_oplog = oplog_path.with_extension("old.bin");
 
     // if checkpoint exists, delete it to simulate incomplete checkpoint
     let _ = std::fs::remove_file(&checkpoint_path);
