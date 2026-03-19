@@ -215,3 +215,59 @@ async fn test_heartbeat_detects_stale_replica() {
     assert!(locs.contains(&"a:9000".to_string()));
     assert!(!locs.contains(&"b:9000".to_string()));
 }
+
+#[tokio::test]
+async fn test_oplog_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("oplog.bin");
+    let path_str = path.to_str().unwrap();
+
+    // phase 1: build up some state
+    {
+        let m = Master::new(60, path_str).unwrap();
+        m.create_file("/a.txt".into()).await.unwrap();
+        m.create_file("/b.txt".into()).await.unwrap();
+        m.add_chunk("/a.txt", vec!["cs1:9000".into()]).await.unwrap();
+        m.add_chunk("/a.txt", vec!["cs2:9000".into()]).await.unwrap();
+        m.add_chunk("/b.txt", vec!["cs1:9000".into()]).await.unwrap();
+
+        // grant lease bumps version on chunk 1
+        m.register_chunkserver("cs1:9000".into(), 1000).await;
+        m.heartbeat("cs1:9000", vec![(1, 0)], 1000).await;
+        m.grant_lease(1).await.unwrap().unwrap();
+        // master drops here, simulating a crash
+    }
+
+    // phase 2: recover from oplog
+    let recovered = Master::recover(60, path_str).await.unwrap();
+
+    // files should exist
+    let a_chunks = recovered.get_file_chunks("/a.txt").await.unwrap();
+    assert_eq!(a_chunks, vec![1, 2]);
+
+    let b_chunks = recovered.get_file_chunks("/b.txt").await.unwrap();
+    assert_eq!(b_chunks, vec![3]);
+
+    // chunk 1 version should be 1 (from grant_lease)
+    let chunks = recovered.chunks.read().await;
+    assert_eq!(chunks[&1].version, 1);
+    assert_eq!(chunks[&2].version, 0);
+    assert_eq!(chunks[&3].version, 0);
+
+    // locations should be empty (rebuilt from heartbeats, not oplog)
+    assert!(chunks[&1].locations.is_empty());
+    assert!(chunks[&2].locations.is_empty());
+
+    // leases should be gone after crash
+    assert!(chunks[&1].primary.is_none());
+    assert!(chunks[&1].lease_expiry.is_none());
+    drop(chunks);
+
+    // next_chunk_handle should be 4 (max handle 3 + 1)
+    assert_eq!(recovered.allocate_chunk_handle().await, 4);
+
+    // new operations should still work and append to oplog
+    recovered.create_file("/c.txt".into()).await.unwrap();
+    recovered.add_chunk("/c.txt", vec!["cs1:9000".into()]).await.unwrap();
+    assert_eq!(recovered.get_file_chunks("/c.txt").await.unwrap(), vec![5]);
+}
