@@ -1,6 +1,6 @@
 # juzfs
 
-A distributed file system in Rust, based on the [Google File System paper](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf). Built from scratch with raw TCP and bincode serialization. No gRPC, no protobuf.
+A distributed file system in Rust, based on the [Google File System paper](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf). Built from scratch with raw TCP and bincode serialization.
 
 For a detailed breakdown of the GFS architecture, see [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown).
 
@@ -16,9 +16,11 @@ Three components, all talking raw TCP:
 
 ### Master
 
-The single metadata server. Holds the file namespace (filenames to chunk handle lists), chunk metadata (version, primary lease, replica locations), and the state of every registered chunkserver. Everything lives in memory behind `RwLock`s. The master never sees file data. Clients ask it "where does this chunk live?", get an answer, and go talk to chunkservers directly. Keeping the master off the data path is the core scalability trick in GFS.
+The single metadata server. Holds the file namespace (filenames to chunk handle lists), chunk metadata (version, primary lease, replica locations), and the state of every registered chunkserver. Everything lives in memory behind `RwLock`s. The master never sees file data -- clients ask it "where does this chunk live?", get an answer, and go talk to chunkservers directly. Keeping the master off the data path is the core scalability trick in GFS.
 
 Chunk locations are deliberately not persisted. On restart, the master knows nothing about which chunkserver holds what. As chunkservers boot and heartbeat in, they report their full chunk inventory with version numbers. The master rebuilds its location map from these reports. This is more robust than persisting locations because the chunkservers are always the ground truth about what's physically on their disks.
+
+All metadata mutations (file creation, chunk allocation, lease grants) are logged to an append-only operation log before being applied to memory. The master recovers from this log on startup, and periodically snapshots its state to a checkpoint file for faster recovery. More on this in the [Operation Log](#operation-log) and [Checkpointing](#checkpointing) sections.
 
 ### Chunkservers
 
@@ -42,10 +44,32 @@ A Rust library (`src/client.rs`) that handles all the protocol complexity. It ca
 
 ## Protocol
 
-Custom TCP framing, length-prefixed:
+Custom TCP framing with magic bytes and length-prefixed payloads:
 
 ```
 [magic: 2B "JF"][version: 1B][msg_type: 1B][payload_len: 4B][payload]
+```
+
+The framing code is compact. Here's the core of `send_frame`:
+
+```rust
+const MAGIC: [u8; 2] = [0x4A, 0x46]; // 'J' 'F'
+const VERSION: u8 = 1;
+
+pub async fn send_frame<T: Serialize>(
+    stream: &mut TcpStream, msg_type: MessageType, payload: &T,
+) -> io::Result<()> {
+    let body = bincode::serialize(payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut header = [0u8; 8];
+    header[0..2].copy_from_slice(&MAGIC);
+    header[2] = VERSION;
+    header[3] = msg_type as u8;
+    header[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    stream.write_all(&header).await?;
+    stream.write_all(&body).await?;
+    Ok(())
+}
 ```
 
 Magic bytes `0x4A 0x46` catch misframed connections immediately. The `msg_type` byte routes messages:
@@ -104,7 +128,31 @@ sequenceDiagram
     P-->>C: Ok
 ```
 
-**Phase 1** pushes data through a chunkserver chain. The client sends to the first node, which buffers and forwards to the next, and so on. Data flows in a single network pass rather than the client uploading to each replica separately. All nodes buffer in memory (the LRU push buffer), nothing touches disk yet.
+**Phase 1** pushes data through a chunkserver chain. The client sends to the first node, which buffers and forwards to the next, and so on. Data flows in a single network pass rather than the client uploading to each replica separately. All nodes buffer in memory (the LRU push buffer), nothing touches disk yet. If any node in the chain fails to forward, the error propagates back through the entire chain to the client via `ChunkServerAck::Error`:
+
+```rust
+// chunkserver buffers data, then forwards to next in chain
+cs.buffer_push(handle, data.clone()).await;
+
+let mut chain_err: Option<String> = None;
+if let Some((next, rest)) = remaining.split_first() {
+    let fwd = ChunkServerToChunkServer::ForwardData {
+        handle, data, remaining: rest.to_vec(),
+    };
+    match TcpStream::connect(next).await {
+        Ok(mut next_conn) => {
+            // send and read downstream ack...
+        }
+        Err(e) => {
+            chain_err = Some(format!("forward to {} unreachable: {}", next, e));
+        }
+    }
+}
+match chain_err {
+    Some(e) => ChunkServerAck::Error(e),
+    None => ChunkServerAck::Ok,
+}
+```
 
 **Phase 2** is where ordering happens. The client tells the primary to commit. The primary assigns a monotonic serial number, flushes its own buffer to disk, then sends `CommitWrite` to each secondary with that serial. Secondaries flush and ack. Only after all replicas confirm does the primary ack the client.
 
@@ -140,13 +188,122 @@ The version lives in three places:
 - **Chunkserver disk**: `.ver` file per chunk, survives restarts
 - **Chunkserver memory**: `HashMap<ChunkHandle, u64>`, loaded from disk on init
 
-When the master grants a lease and bumps the version, it connects to every replica and sends `UpdateVersion { handle, version }`. Each chunkserver persists the new version to its `.ver` file.
+When the master grants a lease and bumps the version, it connects to every replica and sends `UpdateVersion { handle, version }`. Each chunkserver persists the new version to its `.ver` file and inserts into its in-memory map. The insert-not-update matters -- `UpdateVersion` can arrive before the chunk data does (the version bump happens at lease grant time, data arrives later during the write). If the chunkserver only updated existing entries, the version would be lost and the subsequent `store_chunk` would default to version 0:
+
+```rust
+// update_version must always insert, not just update existing entries.
+// UpdateVersion arrives at lease grant time, before any data is written.
+// If we only did get_mut here, the version would be lost when store_chunk
+// later inserts the handle with version 0.
+pub async fn update_version(&self, handle: ChunkHandle, version: u64) -> io::Result<()> {
+    self.write_version_to_disk(handle, version)?;
+    let mut stored = self.stored_chunks.write().await;
+    stored.insert(handle, version);  // insert, not get_mut
+    Ok(())
+}
+```
 
 On heartbeat, each chunkserver reports `(handle, version)` pairs. The master compares:
 - **Version matches or ahead**: healthy replica, stays in the location list
 - **Version behind**: stale replica, removed from locations
 
 Once removed, the stale chunkserver is invisible to clients. No reads or writes will be directed to it. This happens automatically, no manual intervention.
+
+## Operation Log
+
+![Checkpointing](https://www.pixperk.tech/assets/blog/gfs-2.jpg)
+
+The operation log (oplog) is how the master survives crashes. Every metadata mutation is written to an append-only log on disk before it is applied to memory. If the master crashes, it replays the log on startup and reconstructs its state.
+
+The oplog records three types of mutations:
+
+```rust
+pub enum OpLogEntry {
+    CreateFile { filename: String },
+    AddChunk { filename: String, handle: ChunkHandle },
+    GrantLease { handle: ChunkHandle, primary: String, version: u64 },
+}
+```
+
+Each entry is length-prefixed and bincode-serialized. The critical invariant: **the log is flushed to disk before the mutation becomes visible to clients**. If a client got an OK response, that operation survived the crash. If the master crashed before flushing, the client got no response and will retry.
+
+```rust
+// in create_file: log BEFORE applying to memory
+pub async fn create_file(&self, filename: String) -> io::Result<()> {
+    let mut oplog = self.oplog.lock().await;
+    oplog.log(&OpLogEntry::CreateFile { filename: filename.clone() })?;
+    drop(oplog);
+
+    let mut files = self.files.write().await;
+    files.insert(filename, Vec::new());
+    // ...
+}
+```
+
+What the oplog does NOT store:
+- **Chunk locations**: rebuilt from chunkserver heartbeats on startup
+- **Leases**: expired after a crash anyway, chunkservers will request new ones
+- **Chunkserver registrations**: transient state, rebuilt as chunkservers reconnect
+
+On recovery, the master loads the latest checkpoint (if any), then replays the oplog entries on top. Chunkserver heartbeats fill in the locations, and the system is back online.
+
+## Checkpointing
+
+Replaying the entire oplog from the beginning of time gets slow as the system grows. Checkpointing solves this by periodically snapshotting the master's in-memory state to disk, following the GFS paper's approach.
+
+The checkpoint captures the minimum state needed to restore the master:
+
+```rust
+pub struct Checkpoint {
+    pub files: HashMap<String, Vec<ChunkHandle>>,
+    pub chunks: HashMap<ChunkHandle, u64>,  // handle -> version
+    pub next_chunk_handle: ChunkHandle,
+}
+```
+
+The checkpointing flow follows the GFS design -- log rotation first, then background write:
+
+1. **Rotate** the oplog: rename `oplog.bin` to `oplog.old.bin`, open a fresh `oplog.bin`. This is fast (just a rename + open) and happens under the oplog lock. New mutations immediately flow to the fresh log with zero blocking.
+2. **Snapshot** the current state: read `files`, `chunks`, and `next_chunk_handle`. These are read locks, so mutations can proceed concurrently.
+3. **Write checkpoint in the background**: serialize to `checkpoint.bin.tmp`, then atomically rename to `checkpoint.bin`. The tmp+rename ensures that an incomplete write is never visible. Once the checkpoint is written, delete `oplog.old.bin`.
+
+```rust
+pub async fn maybe_checkpoint(&self) -> io::Result<()> {
+    let mut oplog = self.oplog.lock().await;
+    if oplog.count() < CHECKPOINT_THRESHOLD { return Ok(()); }
+
+    // step 1: rotate (fast, under lock)
+    oplog.rotate(Path::new(&self.oplog_path))?;
+    drop(oplog); // new mutations proceed immediately
+
+    // step 2: snapshot state (read locks only)
+    let files = self.files.read().await.clone();
+    let chunks_map = /* ... */;
+    let cp = Checkpoint { files, chunks: chunks_map, next_chunk_handle };
+
+    // step 3: write in background
+    tokio::task::spawn_blocking(move || {
+        write_checkpoint(Path::new(&checkpoint_path), &cp)?;
+        std::fs::remove_file(old_oplog_path).ok();
+    });
+    Ok(())
+}
+```
+
+If the master crashes between rotate and checkpoint completion:
+- `checkpoint.bin` is either missing or incomplete (detected and skipped)
+- `oplog.old.bin` still exists with all pre-rotation entries
+- `oplog.bin` has post-rotation entries
+- Recovery replays `oplog.old.bin` first, then `oplog.bin`, and reconstructs everything
+
+This is the same resilience property described in the GFS paper: "if checkpointing fails midway, the new log still contains all mutations, and incomplete checkpoints are detected and skipped."
+
+The checkpoint triggers after every 100 oplog entries (configurable via `CHECKPOINT_THRESHOLD`). Recovery on startup:
+
+1. Load `checkpoint.bin` if it exists
+2. Replay `oplog.old.bin` if it exists (crash between rotate and checkpoint)
+3. Replay `oplog.bin` (entries written after the last checkpoint)
+4. Wait for chunkserver heartbeats to repopulate locations
 
 ## Data Integrity
 
@@ -220,10 +377,10 @@ commands:
 ### Chunkserver
 
 ```
-chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes]
+chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes] [chunk_size_bytes]
 ```
 
-`capacity_bytes` defaults to 1GB. Available space in heartbeats is `capacity - actual disk usage`.
+`capacity_bytes` defaults to 1GB. `chunk_size_bytes` defaults to 64MB. Available space in heartbeats is `capacity - actual disk usage`.
 
 ### Logging
 
@@ -236,10 +393,14 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 
 ## Implemented
 
-- Single master, in-memory metadata (namespace, chunks, leases)
+- Single master with in-memory metadata (namespace, chunks, leases)
+- Operation log for crash recovery (append-only, length-prefixed bincode)
+- GFS-style checkpointing (log rotation, background snapshot, atomic write)
+- Recovery from checkpoint + oplog replay on startup
 - Chunkservers with disk persistence, CRC32 checksums per 64KB block, version tracking
 - Custom TCP protocol with magic bytes and bincode serialization
-- Two-phase writes: pipelined data push, then primary-coordinated commit
+- Two-phase writes: pipelined data push through chunkserver chain, then primary-coordinated commit
+- Chain error propagation (ForwardData failures bubble back to client)
 - Mutation ordering via monotonic serial numbers on the primary
 - Record append with chunk overflow detection, padding, and transparent retry
 - 60-second write leases with version bump on renewal
@@ -249,16 +410,18 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - Available space tracking from real disk usage
 - Client metadata caching (30s staleness window)
 - Streaming reads with 4-chunk async buffer
-- Chunkserver recovery on restart (scans chunks, checksums, versions)
-- CLI client
+- Chunkserver recovery on restart (scans chunks, checksums, versions from disk)
+- CLI client with create, write, read, append, stream commands
 
 ## Remaining
 
-- Master operation log (oplog) for crash recovery
+![Garbage Collection Flow](https://www.pixperk.tech/assets/blog/gfs-7.jpg)
+
 - Re-replication for under-replicated chunks
 - Chunk rebalancing across chunkservers
-- Garbage collection (lazy delete, heartbeat-driven cleanup)
+- Garbage collection (lazy delete, heartbeat-driven cleanup -- see diagram above)
 - Copy-on-write snapshots
+- Namespace locking for concurrent operations
 
 ## References
 
