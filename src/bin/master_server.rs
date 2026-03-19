@@ -60,7 +60,11 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
         ClientToMaster::GetChunkLocations { handle } => {
             match master.get_chunk_locations(handle).await {
                 Some(locations) => {
-                    tracing::debug!(chunk = handle, replicas = locations.len(), "get chunk locations");
+                    tracing::debug!(
+                        chunk = handle,
+                        replicas = locations.len(),
+                        "get chunk locations"
+                    );
                     MasterToClient::ChunkLocations { handle, locations }
                 }
                 None => {
@@ -95,15 +99,26 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                 }
             }
         }
-        ClientToMaster::GetPrimary { handle, filename } => match master.grant_lease(handle, &filename).await {
+        ClientToMaster::GetPrimary { handle, filename } => match master
+            .grant_lease(handle, &filename)
+            .await
+        {
             Ok(Some((actual_handle, primary, secondaries, version, version_bumped, cow_copy))) => {
                 // if COW triggered, tell chunkservers to copy data locally
                 if let Some((src_handle, dst_handle, locations)) = cow_copy {
-                    tracing::info!(src = src_handle, dst = dst_handle, "cow: sending CopyChunk to chunkservers");
+                    tracing::info!(
+                        src = src_handle,
+                        dst = dst_handle,
+                        "cow: sending CopyChunk to chunkservers"
+                    );
                     for addr in &locations {
                         if let Ok(mut conn) = TcpStream::connect(addr).await {
-                            let msg = MasterToChunkServer::CopyChunk { src: src_handle, dst: dst_handle };
-                            let _ = send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                            let msg = MasterToChunkServer::CopyChunk {
+                                src: src_handle,
+                                dst: dst_handle,
+                            };
+                            let _ =
+                                send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
                         }
                     }
                 }
@@ -121,7 +136,10 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                         .collect();
                     for addr in &all_replicas {
                         if let Ok(mut conn) = TcpStream::connect(addr).await {
-                            let msg = MasterToChunkServer::UpdateVersion { handle: actual_handle, version };
+                            let msg = MasterToChunkServer::UpdateVersion {
+                                handle: actual_handle,
+                                version,
+                            };
                             let _ =
                                 send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
                         } else {
@@ -235,12 +253,15 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
-    let master = Arc::new(Master::recover(60, "oplog.bin").await.expect("failed to recover master from oplog"));
+    let master = Arc::new(
+        Master::recover(60, "oplog.bin")
+            .await
+            .expect("failed to recover master from oplog"),
+    );
     tracing::info!("master recovered from oplog");
     let listener = match TcpListener::bind("0.0.0.0:5000").await {
         Ok(listener) => listener,
@@ -251,6 +272,12 @@ async fn main() {
     };
 
     tracing::info!("master listening on 0.0.0.0:5000");
+
+    // shadow replication listener (supports multiple shadow masters)
+    let shadow_tx = master.oplog_tx.clone();
+    tokio::spawn(async move {
+        juzfs::shadow::start_shadow_listener("0.0.0.0:5001", shadow_tx).await;
+    });
 
     // background GC: sweep expired deleted files every 60s, 5 min retention
     let gc_master = Arc::clone(&master);

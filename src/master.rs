@@ -218,7 +218,7 @@ impl Master {
         }
     }
 
-    async fn apply_entry(
+    pub async fn apply_entry(
         master: &Master,
         entry: OpLogEntry,
         max_handle: &mut ChunkHandle,
@@ -299,7 +299,8 @@ impl Master {
         let _ns = self.ns_lock.lock_mutate(&filename).await;
         self.log_and_broadcast(&OpLogEntry::CreateFile {
             filename: filename.clone(),
-        }).await?;
+        })
+        .await?;
 
         let mut files = self.files.write().await;
         files.insert(filename, Vec::new());
@@ -325,7 +326,8 @@ impl Master {
             filename: filename.clone(),
             hidden_name: hidden_name.clone(),
             timestamp: now,
-        }).await?;
+        })
+        .await?;
 
         let mut files = self.files.write().await;
         let chunks = match files.remove(&filename) {
@@ -354,7 +356,8 @@ impl Master {
         self.log_and_broadcast(&OpLogEntry::Snapshot {
             src: src.clone(),
             dst: dst.clone(),
-        }).await?;
+        })
+        .await?;
 
         let mut files = self.files.write().await;
         let handles = match files.get(&src).cloned() {
@@ -393,7 +396,8 @@ impl Master {
         self.log_and_broadcast(&OpLogEntry::AddChunk {
             filename: filename.to_string(),
             handle,
-        }).await?;
+        })
+        .await?;
 
         let mut files = self.files.write().await;
         let chunks_list = match files.get_mut(filename) {
@@ -553,7 +557,12 @@ impl Master {
             }
         }
 
-        tracing::info!(old = handle, new = new_handle, file = filename, "cow: copied chunk metadata");
+        tracing::info!(
+            old = handle,
+            new = new_handle,
+            file = filename,
+            "cow: copied chunk metadata"
+        );
 
         Ok((new_handle, Some((handle, locations))))
     }
@@ -565,7 +574,16 @@ impl Master {
         &self,
         handle: ChunkHandle,
         filename: &str,
-    ) -> io::Result<Option<(ChunkHandle, String, Vec<String>, u64, bool, Option<(ChunkHandle, ChunkHandle, Vec<String>)>)>> {
+    ) -> io::Result<
+        Option<(
+            ChunkHandle,
+            String,
+            Vec<String>,
+            u64,
+            bool,
+            Option<(ChunkHandle, ChunkHandle, Vec<String>)>,
+        )>,
+    > {
         let _ns = self.ns_lock.lock_mutate(filename).await;
         let (handle, cow_info) = self.cow_copy_if_needed(handle, filename).await?;
         let mut chunks = self.chunks.write().await;
@@ -583,7 +601,14 @@ impl Master {
                     .filter(|l| *l != primary)
                     .cloned()
                     .collect();
-                return Ok(Some((handle, primary.clone(), secondaries, info.version, false, None)));
+                return Ok(Some((
+                    handle,
+                    primary.clone(),
+                    secondaries,
+                    info.version,
+                    false,
+                    None,
+                )));
             }
         }
 
@@ -610,7 +635,8 @@ impl Master {
             handle,
             primary: primary.clone(),
             version,
-        }).await?;
+        })
+        .await?;
 
         // build cow copy info: (src_handle, dst_handle, locations)
         let cow_copy = cow_info.map(|(old_handle, locs)| (old_handle, handle, locs));
@@ -618,7 +644,14 @@ impl Master {
         if let Err(e) = self.maybe_checkpoint().await {
             tracing::error!(error = %e, "checkpoint failed");
         }
-        Ok(Some((handle, primary, secondaries, version, true, cow_copy)))
+        Ok(Some((
+            handle,
+            primary,
+            secondaries,
+            version,
+            true,
+            cow_copy,
+        )))
     }
 
     /// gfs-style checkpoint: rotate the oplog (fast, under lock), then write
