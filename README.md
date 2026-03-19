@@ -554,6 +554,66 @@ Snapshots survive crashes through the oplog and checkpoint:
 - The `Checkpoint` struct includes `ref_count` in chunk metadata (via `#[serde(default)]` for backward compatibility)
 - After recovery, the COW mechanism works identically since it only depends on `ref_count`
 
+## Namespace Locking
+
+![Namespace Locking](https://www.pixperk.tech/assets/blog/gfs-6.jpg)
+
+GFS uses per-path read/write locks instead of a single global lock on the file namespace. This allows concurrent operations on different files while correctly serializing conflicting ones (e.g. creating a file vs deleting its parent directory).
+
+For an operation on `/d1/d2/leaf`:
+- **Read locks** on all ancestors: `/d1`, `/d1/d2`
+- **Read or write lock** on the leaf, depending on the operation type
+
+```mermaid
+graph TD
+    subgraph "create /home/a.txt"
+        A1["read lock /home"] --> A2["write lock /home/a.txt"]
+    end
+    subgraph "create /home/b.txt"
+        B1["read lock /home"] --> B2["write lock /home/b.txt"]
+    end
+    subgraph "delete /home"
+        C1["write lock /home"]
+    end
+
+    A1 -.->|"compatible"| B1
+    A1 -.->|"conflicts"| C1
+```
+
+Two clients creating `/home/a.txt` and `/home/b.txt` both read-lock `/home` (compatible) and write-lock different leaf paths (no conflict). But creating a file under `/home` conflicts with deleting `/home` itself, because one needs a read lock and the other a write lock on the same path.
+
+The implementation uses a `NamespaceLock` with lazily-created per-path `RwLock`s:
+
+```rust
+pub struct NamespaceLock {
+    locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+}
+
+/// lock a path for mutation: read locks on ancestors, write lock on leaf
+pub async fn lock_mutate(&self, path: &str) -> Vec<PathGuard> {
+    let components = path_components(path); // "/a/b/c" -> ["/a", "/a/b", "/a/b/c"]
+
+    // read lock all ancestors
+    for component in &components[..components.len() - 1] {
+        guards.push(PathGuard::Read(self.get_lock(component).read_owned().await));
+    }
+    // write lock the leaf
+    guards.push(PathGuard::Write(self.get_lock(leaf).write_owned().await));
+    guards
+}
+```
+
+Deadlocks are prevented by always acquiring locks top-down (by depth), which the hierarchical path structure guarantees naturally. Guards are held for the duration of the operation and released on drop.
+
+| Operation | Lock type |
+|-----------|-----------|
+| `create_file` | `lock_mutate(filename)` |
+| `delete_file` | `lock_mutate(filename)` |
+| `snapshot` | `lock_read(src)` + `lock_mutate(dst)` |
+| `add_chunk` | `lock_mutate(filename)` |
+| `grant_lease` | `lock_read(filename)` |
+| `get_file_chunks` | `lock_read(filename)` |
+
 ## Data Integrity
 
 ![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
@@ -667,10 +727,10 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - CLI client with create, write, read, append, stream, delete, snapshot commands
 - Garbage collection: lazy deletion, background sweep with configurable retention, heartbeat-driven chunk cleanup
 - Copy-on-write snapshots with reference counting, lease revocation, and handle propagation
+- Namespace locking with per-path read/write locks for concurrent operations
 
 ## Remaining
 
-- Namespace locking for concurrent operations
 - Re-replication for under-replicated chunks
 - Chunk rebalancing across chunkservers
 - Shadow/backup master for read-only failover
