@@ -598,6 +598,164 @@ Deadlocks are prevented by always acquiring locks top-down (by depth), which the
 | `grant_lease` | `lock_read(filename)` |
 | `get_file_chunks` | `lock_read(filename)` |
 
+## Shadow Master
+
+GFS uses shadow masters as read-only replicas that trail the primary by fractions of a second. If the primary goes down, clients transparently fall back to shadows for reads. Shadows don't handle writes or leases -- they exist to keep the system readable during primary outages.
+
+Replication has two modes that work on the same connection:
+
+- **Live stream** -- the steady state. The primary broadcasts oplog entries to shadows in real-time via a `tokio::sync::broadcast` channel as mutations happen. Sub-millisecond lag on localhost.
+- **Catch-up** -- on connect or reconnect, the shadow sends its current offset (how many entries it has applied). The primary reads entries from oplog files on disk, skips what the shadow already has, sends the backlog, then seamlessly transitions to live stream. The shadow doesn't need to distinguish between the two -- it just receives length-prefixed entries either way.
+
+### Architecture
+
+The shadow master replicates the primary's metadata state by tailing its operation log. Three subsystems make this work:
+
+```mermaid
+graph TD
+    P[Primary Master] -->|oplog broadcast| S1[Shadow Master 1]
+    P -->|oplog broadcast| S2[Shadow Master 2]
+    CS1[ChunkServer 1] -->|heartbeat| P
+    CS1 -->|heartbeat| S1
+    CS1 -->|heartbeat| S2
+    CS2[ChunkServer 2] -->|heartbeat| P
+    CS2 -->|heartbeat| S1
+    CS2 -->|heartbeat| S2
+    C[Client] -->|writes| P
+    C -.->|reads fallback| S1
+    C -.->|reads fallback| S2
+```
+
+### Oplog Broadcasting
+
+When the primary logs any mutation (create, delete, snapshot, add chunk, grant lease), it simultaneously broadcasts the raw serialized entry to all connected shadows via a `tokio::sync::broadcast` channel:
+
+```rust
+async fn log_and_broadcast(&self, entry: &OpLogEntry) -> io::Result<()> {
+    let mut oplog = self.oplog.lock().await;
+    oplog.log(entry)?;
+    drop(oplog);
+
+    let data = bincode::serialize(entry)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let _ = self.oplog_tx.send(data); // ignore if no shadows connected
+    self.maybe_checkpoint().await?;
+    Ok(())
+}
+```
+
+The broadcast channel is fire-and-forget from the primary's perspective. If no shadows are connected, the send is a no-op. If a shadow falls behind, the channel reports `Lagged` and the shadow can request a catch-up.
+
+### Shadow Replication Listener
+
+The primary runs a TCP listener on port 5001 that accepts shadow connections. Each shadow gets its own broadcast subscriber. The protocol for each connection:
+
+```mermaid
+sequenceDiagram
+    participant S as Shadow
+    participant P as Primary
+
+    S->>P: connect to :5001
+    S->>P: offset (8 bytes, little-endian)
+    Note over P: read oplog.old.bin + oplog.bin from disk
+    Note over P: skip first `offset` entries
+    P->>S: backlog entries (length-prefixed)
+    Note over P: switch to live broadcast
+    P->>S: live entries as they happen
+    P->>S: live entries...
+```
+
+This handles both fresh shadows (offset 0, get everything) and reconnecting shadows (offset N, get only what they missed).
+
+### Shadow Server
+
+The shadow server (`shadow_server`) is a separate binary that:
+
+1. **Connects to the primary** on port 5001 for replication
+2. **Tracks its offset** -- the total number of oplog entries it has applied
+3. **Replays entries** via `Master::apply_entry()` to rebuild in-memory state
+4. **Serves read-only client requests** -- `GetFileChunks` and `GetChunkLocations`
+5. **Handles chunkserver heartbeats** -- so it knows where chunks live
+6. **Auto-reconnects** on primary failure with its current offset
+
+```rust
+// shadow receives and applies oplog entries
+let entry: OpLogEntry = bincode::deserialize(&buf)?;
+Master::apply_entry(&master, entry, &mut max_handle,
+    &mut files_recovered, &mut chunks_recovered).await;
+
+*offset.write().await += 1; // track progress for reconnect
+```
+
+Write requests to a shadow return `"shadow master is read-only"`.
+
+### The Chunk Location Gap
+
+Replaying the oplog gives the shadow file-to-chunk mappings, but NOT chunk-to-chunkserver locations. Locations come from heartbeats, and heartbeats only went to the primary. Without locations, the shadow knows which chunks a file has but can't tell clients where to find them.
+
+The fix: chunkservers heartbeat to shadows too. Each chunkserver accepts `--shadow <addr>` flags and runs a separate heartbeat loop for each shadow:
+
+```rust
+// chunkserver: fire-and-forget heartbeat to each shadow
+for shadow_addr in shadow_addrs {
+    tokio::spawn(shadow_heartbeat_loop(cs.clone(), shadow_addr));
+}
+```
+
+The shadow handles these heartbeats identically to how the primary does -- `Register` populates the chunkserver map, `Heartbeat` updates chunk locations and versions.
+
+### Client Failover
+
+The client accepts `--shadow` flags and tries them in order when the primary is unreachable:
+
+```rust
+async fn connect_for_read(&self) -> io::Result<TcpStream> {
+    // try primary first
+    if let Ok(stream) = TcpStream::connect(&self.master_addr).await {
+        return Ok(stream);
+    }
+    // fall back to shadows in order
+    for shadow in &self.shadow_addrs {
+        if let Ok(stream) = TcpStream::connect(shadow).await {
+            return Ok(stream);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "all masters down"))
+}
+```
+
+Only reads use this fallback (`GetFileChunks`, `GetChunkLocations`). Writes still require the primary since shadows don't handle leases.
+
+### Catch-Up on Reconnect
+
+When the primary dies and comes back, or when a shadow reconnects after a network partition, the shadow may have missed entries. The offset-based protocol handles this:
+
+```mermaid
+sequenceDiagram
+    participant S as Shadow (offset=50)
+    participant P as Primary (100 entries on disk)
+
+    Note over S: primary was down, shadow stuck at 50
+    Note over P: primary restarts
+    S->>P: reconnect, send offset=50
+    Note over P: read all entries from oplog files
+    Note over P: skip first 50, send entries 50-99
+    P->>S: entry 50, entry 51, ... entry 99
+    Note over S: offset = 100, caught up
+    P->>S: live broadcast resumes
+```
+
+The primary reads entries from both `oplog.old.bin` (pre-checkpoint) and `oplog.bin` (current), combines them, and skips the ones the shadow already has. This works because oplog entries are never modified, only appended.
+
+### What Shadows Don't Do
+
+- **No writes**: no lease grants, no version bumps, no `UpdateVersion` to chunkservers
+- **No GC**: garbage collection runs only on the primary
+- **No snapshots**: metadata-only operation that requires oplog writes
+- **No oplog**: the shadow doesn't persist entries to disk (it replays from the primary)
+
+Shadows are strictly read-only replicas. They trail the primary by the broadcast latency (typically sub-millisecond on localhost) and serve the same metadata queries.
+
 ## Data Integrity
 
 ![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
@@ -630,18 +788,22 @@ The cycle:
 Start the cluster in separate terminals:
 
 ```bash
-# master
+# master (listens on :5000 for clients/chunkservers, :5001 for shadow replication)
 cargo run --bin master-server
 
-# three chunkservers
-cargo run --bin chunkserver-node -- 127.0.0.1:6001 /tmp/cs1 127.0.0.1:5000
-cargo run --bin chunkserver-node -- 127.0.0.1:6002 /tmp/cs2 127.0.0.1:5000
-cargo run --bin chunkserver-node -- 127.0.0.1:6003 /tmp/cs3 127.0.0.1:5000
+# shadow master (connects to primary :5001, serves reads on :5002)
+cargo run --bin shadow-server
+
+# three chunkservers (heartbeat to both primary and shadow)
+cargo run --bin chunkserver-node -- 127.0.0.1:6001 /tmp/cs1 127.0.0.1:5000 --shadow 127.0.0.1:5002
+cargo run --bin chunkserver-node -- 127.0.0.1:6002 /tmp/cs2 127.0.0.1:5000 --shadow 127.0.0.1:5002
+cargo run --bin chunkserver-node -- 127.0.0.1:6003 /tmp/cs3 127.0.0.1:5000 --shadow 127.0.0.1:5002
 ```
 
 Then use the CLI:
 
 ```bash
+# basic operations
 cargo run --bin juzfs -- create /hello.txt
 cargo run --bin juzfs -- write /hello.txt 0 "the quick brown fox"
 cargo run --bin juzfs -- read /hello.txt
@@ -650,6 +812,9 @@ cargo run --bin juzfs -- append /hello.txt "another line"
 cargo run --bin juzfs -- stream /hello.txt
 cargo run --bin juzfs -- delete /hello.txt
 cargo run --bin juzfs -- snapshot /hello.txt /backup.txt
+
+# with shadow failover (reads fall back to shadow if primary is down)
+cargo run --bin juzfs -- --shadow 127.0.0.1:5002 read /hello.txt
 ```
 
 ### CLI
@@ -659,6 +824,7 @@ juzfs [options] <command> [args]
 
 options:
   --master <addr>        master address (default: 127.0.0.1:5000)
+  --shadow <addr>        shadow master address for read failover (repeatable)
   --chunk-size <bytes>   chunk size in bytes (default: 64MB)
 
 commands:
@@ -674,10 +840,18 @@ commands:
 ### Chunkserver
 
 ```
-chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes] [chunk_size_bytes]
+chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes] [chunk_size_bytes] [--shadow <addr>]...
 ```
 
-`capacity_bytes` defaults to 1GB. `chunk_size_bytes` defaults to 64MB. Available space in heartbeats is `capacity - actual disk usage`.
+`capacity_bytes` defaults to 1GB. `chunk_size_bytes` defaults to 64MB. Available space in heartbeats is `capacity - actual disk usage`. Use `--shadow` to register and heartbeat to shadow masters (repeatable for multiple shadows).
+
+### Shadow Server
+
+```
+shadow-server [primary_replication_addr] [listen_port]
+```
+
+Defaults: primary at `127.0.0.1:5001`, listens on port `5002`. Connects to the primary's replication port, replays the oplog, and serves read-only client requests. Auto-reconnects on primary failure.
 
 ### Logging
 
@@ -712,12 +886,14 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - Garbage collection: lazy deletion, background sweep with configurable retention, heartbeat-driven chunk cleanup
 - Copy-on-write snapshots with reference counting, lease revocation, and handle propagation
 - Namespace locking with per-path read/write locks for concurrent operations
+- Shadow master with real-time oplog replication, offset-based catch-up, and client read failover
+- Chunkserver dual heartbeat to primary and shadow masters for location data
+- Shadow auto-reconnect with backlog replay from oplog files
 
 ## Remaining
 
 - Re-replication for under-replicated chunks
 - Chunk rebalancing across chunkservers
-- Shadow/backup master for read-only failover
 
 ## References
 
