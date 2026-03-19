@@ -872,3 +872,164 @@ async fn test_plan_re_replication_multiple_under_replicated() {
     assert!(handles.contains(&1));
     assert!(handles.contains(&2));
 }
+
+// ==================== rebalancing tests ====================
+
+#[tokio::test]
+async fn test_plan_rebalance_balanced_cluster() {
+    // 3 servers, each with 1 chunk - balanced, no moves needed
+    let m = make_master();
+    m.create_file("/a.txt".into()).await.unwrap();
+    m.create_file("/b.txt".into()).await.unwrap();
+    m.create_file("/c.txt".into()).await.unwrap();
+    m.add_chunk("/a.txt", vec!["cs1:6000".into(), "cs2:6001".into(), "cs3:6002".into()]).await.unwrap();
+    m.add_chunk("/b.txt", vec!["cs1:6000".into(), "cs2:6001".into(), "cs3:6002".into()]).await.unwrap();
+    m.add_chunk("/c.txt", vec!["cs1:6000".into(), "cs2:6001".into(), "cs3:6002".into()]).await.unwrap();
+
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.register_chunkserver("cs2:6001".into(), 1_000_000).await;
+    m.register_chunkserver("cs3:6002".into(), 1_000_000).await;
+
+    m.heartbeat("cs1:6000", vec![(1, 0), (2, 0), (3, 0)], 1_000_000).await;
+    m.heartbeat("cs2:6001", vec![(1, 0), (2, 0), (3, 0)], 1_000_000).await;
+    m.heartbeat("cs3:6002", vec![(1, 0), (2, 0), (3, 0)], 1_000_000).await;
+
+    let actions = m.plan_rebalance().await;
+    assert!(actions.is_empty());
+}
+
+#[tokio::test]
+async fn test_plan_rebalance_single_server() {
+    // only 1 server - can't rebalance
+    let m = make_master();
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.heartbeat("cs1:6000", vec![(1, 0)], 1_000_000).await;
+
+    let actions = m.plan_rebalance().await;
+    assert!(actions.is_empty());
+}
+
+#[tokio::test]
+async fn test_plan_rebalance_imbalanced() {
+    // cs1 has 5 chunks, cs2 has 5 chunks, cs3 has 5 chunks, cs4 has 0 chunks
+    // avg = 3.75, threshold = 4 (3.75 * 1.2 = 4.5 -> 4)
+    // cs1,cs2,cs3 are at 5 which is > 4, cs4 is at 0 which is < avg
+    let m = make_master();
+    let all = vec!["cs1:6000".into(), "cs2:6001".into(), "cs3:6002".into()];
+
+    for i in 0..5 {
+        let fname = format!("/f{}.txt", i);
+        m.create_file(fname.clone()).await.unwrap();
+        m.add_chunk(&fname, all.clone()).await.unwrap();
+    }
+
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.register_chunkserver("cs2:6001".into(), 1_000_000).await;
+    m.register_chunkserver("cs3:6002".into(), 1_000_000).await;
+    m.register_chunkserver("cs4:6003".into(), 1_000_000).await;
+
+    let cs_chunks: Vec<(u64, u64)> = (1..=5).map(|h| (h, 0)).collect();
+    m.heartbeat("cs1:6000", cs_chunks.clone(), 1_000_000).await;
+    m.heartbeat("cs2:6001", cs_chunks.clone(), 1_000_000).await;
+    m.heartbeat("cs3:6002", cs_chunks.clone(), 1_000_000).await;
+    m.heartbeat("cs4:6003", vec![], 1_000_000).await;
+
+    let actions = m.plan_rebalance().await;
+    // should plan at least 1 move to cs4
+    assert!(!actions.is_empty());
+    for (_handle, _source, target) in &actions {
+        assert_eq!(target, "cs4:6003");
+    }
+}
+
+#[tokio::test]
+async fn test_register_and_confirm_rebalance() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    m.add_chunk("/f.txt", vec!["cs1:6000".into(), "cs2:6001".into(), "cs3:6002".into()]).await.unwrap();
+
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.register_chunkserver("cs2:6001".into(), 1_000_000).await;
+    m.register_chunkserver("cs3:6002".into(), 1_000_000).await;
+    m.register_chunkserver("cs4:6003".into(), 1_000_000).await;
+
+    m.heartbeat("cs1:6000", vec![(1, 0)], 1_000_000).await;
+    m.heartbeat("cs2:6001", vec![(1, 0)], 1_000_000).await;
+    m.heartbeat("cs3:6002", vec![(1, 0)], 1_000_000).await;
+
+    // register a pending move: chunk 1 from cs1 to cs4
+    m.register_pending_rebalance(1, "cs1:6000".into(), "cs4:6003".into()).await;
+
+    // confirm before target has the chunk - nothing happens
+    let to_delete = m.confirm_rebalance().await;
+    assert!(to_delete.is_empty());
+
+    // pending should still be there
+    assert_eq!(m.pending_rebalance.read().await.len(), 1);
+
+    // simulate target heartbeating with the chunk
+    m.heartbeat("cs4:6003", vec![(1, 0)], 1_000_000).await;
+
+    // now confirm - should succeed
+    let to_delete = m.confirm_rebalance().await;
+    assert!(to_delete.contains_key("cs1:6000"));
+    assert_eq!(to_delete["cs1:6000"], vec![1]);
+
+    // pending should be cleared
+    assert!(m.pending_rebalance.read().await.is_empty());
+
+    // cs1 should be removed from chunk 1's locations
+    let locs = m.get_chunk_locations(1).await.unwrap();
+    assert!(!locs.contains(&"cs1:6000".to_string()));
+    assert!(locs.contains(&"cs4:6003".to_string()));
+}
+
+#[tokio::test]
+async fn test_confirm_rebalance_chunk_deleted() {
+    // if the chunk was deleted (e.g. by GC) while pending, just clean up
+    let m = make_master();
+    m.register_pending_rebalance(999, "cs1:6000".into(), "cs4:6003".into()).await;
+
+    let to_delete = m.confirm_rebalance().await;
+    // chunk 999 doesn't exist, pending should be cleared
+    assert!(m.pending_rebalance.read().await.is_empty());
+    // no delete needed since the chunk is already gone
+    assert!(to_delete.is_empty());
+}
+
+#[tokio::test]
+async fn test_plan_rebalance_skips_pending() {
+    // if a chunk already has a pending rebalance, don't plan another move for it
+    let m = make_master();
+    let all = vec!["cs1:6000".into(), "cs2:6001".into(), "cs3:6002".into()];
+
+    for i in 0..5 {
+        let fname = format!("/f{}.txt", i);
+        m.create_file(fname.clone()).await.unwrap();
+        m.add_chunk(&fname, all.clone()).await.unwrap();
+    }
+
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.register_chunkserver("cs2:6001".into(), 1_000_000).await;
+    m.register_chunkserver("cs3:6002".into(), 1_000_000).await;
+    m.register_chunkserver("cs4:6003".into(), 1_000_000).await;
+
+    let cs_chunks: Vec<(u64, u64)> = (1..=5).map(|h| (h, 0)).collect();
+    m.heartbeat("cs1:6000", cs_chunks.clone(), 1_000_000).await;
+    m.heartbeat("cs2:6001", cs_chunks.clone(), 1_000_000).await;
+    m.heartbeat("cs3:6002", cs_chunks.clone(), 1_000_000).await;
+    m.heartbeat("cs4:6003", vec![], 1_000_000).await;
+
+    let actions1 = m.plan_rebalance().await;
+    // register all planned moves as pending
+    for (handle, source, target) in &actions1 {
+        m.register_pending_rebalance(*handle, source.clone(), target.clone()).await;
+    }
+
+    // plan again - shouldn't re-plan the same chunks
+    let actions2 = m.plan_rebalance().await;
+    for (handle, _, _) in &actions2 {
+        let already_planned: Vec<u64> = actions1.iter().map(|(h, _, _)| *h).collect();
+        assert!(!already_planned.contains(handle), "chunk {} was planned twice", handle);
+    }
+}
