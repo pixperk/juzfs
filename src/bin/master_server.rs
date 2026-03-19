@@ -276,7 +276,7 @@ async fn main() {
     // shadow replication listener (supports multiple shadow masters)
     let shadow_tx = master.oplog_tx.clone();
     tokio::spawn(async move {
-        juzfs::shadow::start_shadow_listener("0.0.0.0:5001", shadow_tx).await;
+        juzfs::shadow::start_shadow_listener("0.0.0.0:5001", shadow_tx, "oplog.bin".to_string()).await;
     });
 
     // background GC: sweep expired deleted files every 60s, 5 min retention

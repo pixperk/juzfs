@@ -2,20 +2,31 @@ use std::sync::Arc;
 
 use juzfs::{
     master::{Master, OpLogEntry},
-    messages::{ClientToMaster, MasterToClient},
+    messages::{ChunkServerToMaster, ClientToMaster, MasterToChunkServer, MasterToClient},
     protocol::{MessageType, decode_payload, read_raw_frame, send_frame},
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
-/// connect to primary and replay oplog entries as they arrive
-async fn replication_loop(primary_addr: &str, master: Arc<Master>) {
+/// connect to primary and replay oplog entries as they arrive.
+/// tracks total entries applied so we can resume from the right offset on reconnect.
+async fn replication_loop(primary_addr: &str, master: Arc<Master>, offset: Arc<RwLock<u64>>) {
     loop {
-        tracing::info!(primary = primary_addr, "connecting to primary for replication");
+        let current_offset = *offset.read().await;
+        tracing::info!(primary = primary_addr, offset = current_offset, "connecting to primary for replication");
         match TcpStream::connect(primary_addr).await {
             Ok(mut stream) => {
-                tracing::info!("connected to primary, receiving oplog stream");
-                if let Err(e) = receive_oplog_stream(&mut stream, &master).await {
+                // send our current offset so primary knows where to start
+                let offset_bytes = current_offset.to_le_bytes();
+                if let Err(e) = stream.write_all(&offset_bytes).await {
+                    tracing::error!(error = %e, "failed to send offset");
+                    continue;
+                }
+                let _ = stream.flush().await;
+
+                tracing::info!(offset = current_offset, "connected to primary, receiving oplog stream");
+                if let Err(e) = receive_oplog_stream(&mut stream, &master, &offset).await {
                     tracing::error!(error = %e, "replication stream error");
                 }
             }
@@ -23,16 +34,18 @@ async fn replication_loop(primary_addr: &str, master: Arc<Master>) {
                 tracing::warn!(error = %e, "failed to connect to primary");
             }
         }
-        // retry after a delay
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
 
 /// read length-prefixed oplog entries from the primary and replay them
-async fn receive_oplog_stream(stream: &mut TcpStream, master: &Master) -> std::io::Result<()> {
+async fn receive_oplog_stream(
+    stream: &mut TcpStream,
+    master: &Master,
+    offset: &RwLock<u64>,
+) -> std::io::Result<()> {
     let mut len_buf = [0u8; 4];
     let mut max_handle = 0u64;
-    let mut entries_applied = 0u64;
 
     loop {
         stream.read_exact(&mut len_buf).await?;
@@ -54,52 +67,84 @@ async fn receive_oplog_stream(stream: &mut TcpStream, master: &Master) -> std::i
         )
         .await;
 
-        entries_applied += 1;
-        if entries_applied % 100 == 0 {
-            tracing::info!(entries = entries_applied, "shadow replay progress");
+        let mut off = offset.write().await;
+        *off += 1;
+        let current = *off;
+        drop(off);
+
+        if current % 100 == 0 {
+            tracing::info!(entries = current, "shadow replay progress");
         }
     }
 }
 
-/// handle read-only client requests
-async fn handle_client(mut stream: TcpStream, master: Arc<Master>) {
+/// handle incoming connections: client reads (msg_type 1) or chunkserver heartbeats (msg_type 3)
+async fn handle_connection(mut stream: TcpStream, master: Arc<Master>) {
     loop {
         let (msg_type, payload) = match read_raw_frame(&mut stream).await {
             Ok(v) => v,
             Err(_) => break,
         };
 
-        if msg_type != 1 {
-            tracing::warn!(msg_type, "shadow only handles client messages");
-            break;
-        }
-
-        let msg: ClientToMaster = match decode_payload(&payload) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!(error = %e, "decode failed");
+        match msg_type {
+            1 => handle_client_msg(&mut stream, &master, &payload).await,
+            3 => handle_chunkserver_msg(&mut stream, &master, &payload).await,
+            _ => {
+                tracing::warn!(msg_type, "shadow: unknown message type");
                 break;
             }
-        };
-
-        let response = match msg {
-            ClientToMaster::GetFileChunks { filename } => {
-                match master.get_file_chunks(&filename).await {
-                    Some(chunks) => MasterToClient::FileChunks(chunks),
-                    None => MasterToClient::Error("file not found".into()),
-                }
-            }
-            ClientToMaster::GetChunkLocations { handle } => {
-                match master.get_chunk_locations(handle).await {
-                    Some(locations) => MasterToClient::ChunkLocations { handle, locations },
-                    None => MasterToClient::Error("chunk not found".into()),
-                }
-            }
-            _ => MasterToClient::Error("shadow master is read-only".into()),
-        };
-
-        let _ = send_frame(&mut stream, MessageType::MasterToClient, &response).await;
+        }
     }
+}
+
+async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u8]) {
+    let msg: ClientToMaster = match decode_payload(payload) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "decode failed");
+            return;
+        }
+    };
+
+    let response = match msg {
+        ClientToMaster::GetFileChunks { filename } => {
+            match master.get_file_chunks(&filename).await {
+                Some(chunks) => MasterToClient::FileChunks(chunks),
+                None => MasterToClient::Error("file not found".into()),
+            }
+        }
+        ClientToMaster::GetChunkLocations { handle } => {
+            match master.get_chunk_locations(handle).await {
+                Some(locations) => MasterToClient::ChunkLocations { handle, locations },
+                None => MasterToClient::Error("chunk not found".into()),
+            }
+        }
+        _ => MasterToClient::Error("shadow master is read-only".into()),
+    };
+
+    let _ = send_frame(stream, MessageType::MasterToClient, &response).await;
+}
+
+async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload: &[u8]) {
+    let msg: ChunkServerToMaster = match decode_payload(payload) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "decode chunkserver msg failed");
+            return;
+        }
+    };
+
+    match msg {
+        ChunkServerToMaster::Register { addr, available_space } => {
+            tracing::info!(chunkserver = %addr, "shadow: chunkserver registered");
+            master.register_chunkserver(addr, available_space).await;
+        }
+        ChunkServerToMaster::Heartbeat { addr, chunks, available_space } => {
+            master.heartbeat(&addr, chunks, available_space).await;
+        }
+    };
+
+    let _ = send_frame(stream, MessageType::MasterToChunkServer, &MasterToChunkServer::Ok).await;
 }
 
 #[tokio::main]
@@ -122,8 +167,10 @@ async fn main() {
     // start replication from primary
     let repl_master = Arc::clone(&master);
     let primary = primary_addr.to_string();
+    let offset = Arc::new(RwLock::new(0u64));
+    let repl_offset = Arc::clone(&offset);
     tokio::spawn(async move {
-        replication_loop(&primary, repl_master).await;
+        replication_loop(&primary, repl_master, repl_offset).await;
     });
 
     // listen for read-only client requests
@@ -135,7 +182,7 @@ async fn main() {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let m = Arc::clone(&master);
-                tokio::spawn(handle_client(stream, m));
+                tokio::spawn(handle_connection(stream, m));
             }
             Err(e) => {
                 tracing::error!(error = %e, "accept failed");

@@ -356,6 +356,34 @@ async fn heartbeat_loop(cs: Arc<ChunkServer>, master_addr: String) {
     }
 }
 
+/// heartbeat to a shadow master (register + periodic heartbeat, ignore responses)
+async fn shadow_heartbeat_loop(cs: Arc<ChunkServer>, shadow_addr: String) {
+    // register
+    if let Ok(mut conn) = TcpStream::connect(&shadow_addr).await {
+        let register = ChunkServerToMaster::Register {
+            addr: cs.addr().to_string(),
+            available_space: cs.available_space(),
+        };
+        let _ = send_frame(&mut conn, MessageType::ChunkServerToMaster, &register).await;
+        let _ = juzfs::protocol::read_raw_frame(&mut conn).await;
+        tracing::info!(shadow = %shadow_addr, "registered with shadow master");
+    }
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        if let Ok(mut conn) = TcpStream::connect(&shadow_addr).await {
+            let hb = ChunkServerToMaster::Heartbeat {
+                addr: cs.addr().to_string(),
+                chunks: cs.list_chunks().await,
+                available_space: cs.available_space(),
+            };
+            let _ = send_frame(&mut conn, MessageType::ChunkServerToMaster, &hb).await;
+            let _ = juzfs::protocol::read_raw_frame(&mut conn).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -368,7 +396,7 @@ async fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes] [chunk_size_bytes]");
+        eprintln!("usage: chunkserver-node <addr> <data_dir> <master_addr> [capacity_bytes] [chunk_size_bytes] [--shadow <addr>]...");
         eprintln!("  e.g: chunkserver-node 127.0.0.1:6000 /tmp/cs1 127.0.0.1:5000");
         return;
     }
@@ -379,6 +407,22 @@ async fn main() {
 
     let capacity: u64 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1_000_000_000);
     let chunk_size: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(juzfs::CHUNK_SIZE);
+
+    // collect --shadow addresses
+    let mut shadow_addrs: Vec<String> = Vec::new();
+    let mut i = 6;
+    while i < args.len() {
+        if args[i] == "--shadow" {
+            if let Some(shadow) = args.get(i + 1) {
+                shadow_addrs.push(shadow.clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
     let cs = Arc::new(ChunkServer::new(data_dir.into(), addr.clone(), capacity, chunk_size));
     if let Err(e) = cs.init().await {
         tracing::error!(error = %e, "failed to init chunkserver");
@@ -394,6 +438,12 @@ async fn main() {
 
     let cs_hb = Arc::clone(&cs);
     tokio::spawn(heartbeat_loop(cs_hb, master_addr));
+
+    // heartbeat to shadow masters too (for read failover)
+    for shadow_addr in shadow_addrs {
+        let cs_shadow = Arc::clone(&cs);
+        tokio::spawn(shadow_heartbeat_loop(cs_shadow, shadow_addr));
+    }
 
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,

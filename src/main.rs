@@ -5,6 +5,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("options:");
     eprintln!("  --master <addr>        master address (default: 127.0.0.1:5000)");
+    eprintln!("  --shadow <addr>        shadow master address (can repeat)");
     eprintln!("  --chunk-size <bytes>    chunk size in bytes (default: 64MB)");
     eprintln!();
     eprintln!("commands:");
@@ -17,9 +18,10 @@ fn usage() -> ! {
     std::process::exit(1);
 }
 
-fn parse_args() -> (String, u64, Vec<String>) {
+fn parse_args() -> (String, Vec<String>, u64, Vec<String>) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut master = "127.0.0.1:5000".to_string();
+    let mut shadows: Vec<String> = Vec::new();
     let mut chunk_size = juzfs::CHUNK_SIZE;
     let mut i = 0;
 
@@ -27,6 +29,10 @@ fn parse_args() -> (String, u64, Vec<String>) {
         match args[i].as_str() {
             "--master" => {
                 master = args.get(i + 1).cloned().unwrap_or_else(|| usage());
+                i += 2;
+            }
+            "--shadow" => {
+                shadows.push(args.get(i + 1).cloned().unwrap_or_else(|| usage()));
                 i += 2;
             }
             "--chunk-size" => {
@@ -41,17 +47,17 @@ fn parse_args() -> (String, u64, Vec<String>) {
     }
 
     let rest = args[i..].to_vec();
-    (master, chunk_size, rest)
+    (master, shadows, chunk_size, rest)
 }
 
 #[tokio::main]
 async fn main() {
-    let (master, chunk_size, args) = parse_args();
+    let (master, shadows, chunk_size, args) = parse_args();
     if args.is_empty() {
         usage();
     }
 
-    let client = Client::new(master, chunk_size);
+    let client = Client::new(master, chunk_size).with_shadows(shadows);
 
     let result = match args[0].as_str() {
         "create" => cmd_create(&client, &args[1..]).await,

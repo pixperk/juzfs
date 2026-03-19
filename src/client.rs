@@ -13,6 +13,7 @@ use crate::{
 
 pub struct Client {
     master_addr: String,
+    shadow_addrs: Vec<String>,
     chunk_size: u64,
     metadata_cache: RwLock<HashMap<String, Vec<CachedChunkInfo>>>, // filename -> chunk info
 }
@@ -27,9 +28,37 @@ impl Client {
     pub fn new(master_addr: String, chunk_size: u64) -> Self {
         Self {
             master_addr,
+            shadow_addrs: Vec::new(),
             chunk_size,
             metadata_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn with_shadows(mut self, shadows: Vec<String>) -> Self {
+        self.shadow_addrs = shadows;
+        self
+    }
+
+    /// try connecting to primary first, then fall back to shadows.
+    /// used for read-only operations.
+    async fn connect_for_read(&self) -> io::Result<TcpStream> {
+        // try primary
+        if let Ok(conn) = TcpStream::connect(&self.master_addr).await {
+            return Ok(conn);
+        }
+
+        // fall back to shadows
+        for addr in &self.shadow_addrs {
+            if let Ok(conn) = TcpStream::connect(addr).await {
+                tracing::info!(shadow = %addr, "falling back to shadow master");
+                return Ok(conn);
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "primary and all shadow masters unreachable",
+        ))
     }
 
     /// create a file on the master
@@ -335,7 +364,7 @@ impl Client {
         &self,
         filename: &str,
     ) -> io::Result<Vec<(ChunkHandle, Vec<String>)>> {
-        let mut conn = TcpStream::connect(&self.master_addr).await?;
+        let mut conn = self.connect_for_read().await?;
         //get all chunk handles from master
         send_frame(
             &mut conn,
