@@ -319,6 +319,45 @@ async fn main() {
         }
     });
 
+    // background rebalancing: two-phase, every 120s
+    let bal_master = Arc::clone(&master);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+        loop {
+            interval.tick().await;
+
+            // phase 2: confirm pending moves from previous cycle
+            let to_delete = bal_master.confirm_rebalance().await;
+            for (source, handles) in &to_delete {
+                tracing::info!(source = %source, chunks = ?handles, "rebalance: confirmed, deleting from source");
+                if let Ok(mut conn) = TcpStream::connect(source).await {
+                    let msg = MasterToChunkServer::DeleteChunks(handles.clone());
+                    let _ = send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                }
+            }
+
+            // phase 1: plan new moves
+            let actions = bal_master.plan_rebalance().await;
+            if actions.is_empty() {
+                continue;
+            }
+            tracing::info!(moves = actions.len(), "rebalance: planning moves");
+            for (handle, source, target) in &actions {
+                tracing::info!(chunk = handle, source = %source, target = %target, "rebalance: initiating move");
+                if let Ok(mut conn) = TcpStream::connect(source).await {
+                    let msg = MasterToChunkServer::ReplicateChunk {
+                        handle: *handle,
+                        target: target.clone(),
+                    };
+                    let _ = send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                    bal_master.register_pending_rebalance(*handle, source.clone(), target.clone()).await;
+                } else {
+                    tracing::warn!(chunk = handle, source = %source, "rebalance: source unreachable");
+                }
+            }
+        }
+    });
+
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

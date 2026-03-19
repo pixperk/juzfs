@@ -42,6 +42,8 @@ pub struct Master {
     pub ns_lock: NamespaceLock,
     /// broadcast channel for streaming oplog entries to shadow masters
     pub oplog_tx: broadcast::Sender<Vec<u8>>,
+    /// pending rebalance moves: handle -> (source_to_delete, target_to_confirm)
+    pub pending_rebalance: Arc<RwLock<HashMap<ChunkHandle, (String, String)>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -191,6 +193,7 @@ impl Master {
             checkpoint_path,
             ns_lock: NamespaceLock::new(),
             oplog_tx: broadcast::channel(1024).0,
+            pending_rebalance: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -784,5 +787,144 @@ impl Master {
             actions.push((*handle, source, target_addr, *version));
         }
         actions
+    }
+
+    /// compute the average chunk count across all chunkservers.
+    /// returns (avg, most_loaded_addr, most_loaded_count, least_loaded_addr, least_loaded_count).
+    async fn server_load_stats(&self) -> Option<(f64, String, usize, String, usize)> {
+        let servers = self.chunkservers.read().await;
+        if servers.len() < 2 {
+            return None;
+        }
+        let total_chunks: usize = servers.values().map(|s| s.chunks.len()).sum();
+        let avg = total_chunks as f64 / servers.len() as f64;
+
+        let most = servers.values().max_by_key(|s| s.chunks.len())?;
+        let least = servers.values().min_by_key(|s| s.chunks.len())?;
+
+        Some((avg, most.addr.clone(), most.chunks.len(), least.addr.clone(), least.chunks.len()))
+    }
+
+    /// phase 1: find chunks to move from overloaded servers to underloaded ones.
+    /// a server is "overloaded" if it has more than avg * 1.2 chunks.
+    /// returns list of (handle, source, target) moves to initiate.
+    pub async fn plan_rebalance(&self) -> Vec<(ChunkHandle, String, String)> {
+        let stats = match self.server_load_stats().await {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let (avg, _, _, _, _) = stats;
+        let threshold = (avg * 1.2) as usize;
+        if threshold == 0 {
+            return Vec::new();
+        }
+
+        let servers = self.chunkservers.read().await;
+        let chunks = self.chunks.read().await;
+        let pending = self.pending_rebalance.read().await;
+
+        // find overloaded servers
+        let mut overloaded: Vec<_> = servers.values()
+            .filter(|s| s.chunks.len() > threshold)
+            .collect();
+        overloaded.sort_by(|a, b| b.chunks.len().cmp(&a.chunks.len()));
+
+        // find underloaded servers (below average)
+        let mut underloaded: Vec<_> = servers.values()
+            .filter(|s| (s.chunks.len() as f64) < avg)
+            .collect();
+        underloaded.sort_by(|a, b| a.chunks.len().cmp(&b.chunks.len()));
+
+        let mut actions = Vec::new();
+        let mut target_idx = 0;
+
+        for source in &overloaded {
+            let excess = source.chunks.len() - threshold;
+            let mut moved = 0;
+
+            for (handle, _version) in &source.chunks {
+                if moved >= excess { break; }
+                if target_idx >= underloaded.len() { break; }
+                if pending.contains_key(handle) { continue; }
+
+                // only move chunks that have enough replicas (don't break replication)
+                let info = match chunks.get(handle) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                if info.locations.len() < REPLICATION_FACTOR { continue; }
+
+                // pick a target that doesn't already hold this chunk
+                let target = loop {
+                    if target_idx >= underloaded.len() { break None; }
+                    let t = &underloaded[target_idx];
+                    if !info.locations.contains(&t.addr) {
+                        break Some(t.addr.clone());
+                    }
+                    target_idx += 1;
+                };
+
+                let target_addr = match target {
+                    Some(t) => t,
+                    None => break,
+                };
+
+                actions.push((*handle, source.addr.clone(), target_addr));
+                moved += 1;
+            }
+        }
+
+        actions
+    }
+
+    /// record that a rebalance move has been initiated (phase 1 complete).
+    /// the master will confirm on the next cycle after the target heartbeats the chunk.
+    pub async fn register_pending_rebalance(&self, handle: ChunkHandle, source: String, target: String) {
+        self.pending_rebalance.write().await.insert(handle, (source, target));
+    }
+
+    /// phase 2: check pending rebalance moves. if the target now holds the chunk,
+    /// remove the source from the chunk's location list and tell it to delete.
+    /// returns list of (source_addr, handles_to_delete).
+    pub async fn confirm_rebalance(&self) -> HashMap<String, Vec<ChunkHandle>> {
+        let mut pending = self.pending_rebalance.write().await;
+        let chunks = self.chunks.read().await;
+        let mut to_delete: HashMap<String, Vec<ChunkHandle>> = HashMap::new();
+        let mut confirmed = Vec::new();
+
+        for (handle, (source, target)) in pending.iter() {
+            let info = match chunks.get(handle) {
+                Some(i) => i,
+                None => {
+                    confirmed.push(*handle);
+                    continue;
+                }
+            };
+
+            // check if target now has the chunk (reported via heartbeat)
+            if info.locations.contains(target) {
+                // target confirmed, schedule source for deletion
+                to_delete.entry(source.clone()).or_default().push(*handle);
+                confirmed.push(*handle);
+            }
+        }
+
+        for h in &confirmed {
+            pending.remove(h);
+        }
+        drop(pending);
+        drop(chunks);
+
+        // remove source from location lists
+        let mut chunks = self.chunks.write().await;
+        for (source, handles) in &to_delete {
+            for handle in handles {
+                if let Some(info) = chunks.get_mut(handle) {
+                    info.locations.retain(|l| l != source);
+                }
+            }
+        }
+
+        to_delete
     }
 }

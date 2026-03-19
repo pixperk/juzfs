@@ -756,6 +756,79 @@ The primary reads entries from both `oplog.old.bin` (pre-checkpoint) and `oplog.
 
 Shadows are strictly read-only replicas. They trail the primary by the broadcast latency (typically sub-millisecond on localhost) and serve the same metadata queries.
 
+## Re-Replication
+
+When a chunkserver dies or a disk fails, some chunks end up with fewer than 3 replicas. The master detects this and automatically copies data to new chunkservers to restore the replication factor.
+
+### Detection
+
+Every 30 seconds, the master scans its chunk metadata for chunks with fewer than `REPLICATION_FACTOR` (3) live locations. Chunks with zero locations are skipped -- there's no source to copy from (all replicas are lost).
+
+```rust
+pub async fn detect_under_replicated(&self) -> Vec<(ChunkHandle, Vec<String>, u64)> {
+    let chunks = self.chunks.read().await;
+    for (handle, info) in chunks.iter() {
+        if info.locations.len() < REPLICATION_FACTOR && !info.locations.is_empty() {
+            under.push((*handle, info.locations.clone(), info.version));
+        }
+    }
+    under
+}
+```
+
+### Planning
+
+For each under-replicated chunk, the master picks a target chunkserver that:
+1. Doesn't already hold this chunk (no point replicating to an existing holder)
+2. Has the most available disk space (same placement strategy as new chunk allocation)
+
+The source is the first known replica. The result is a list of `(handle, source, target, version)` actions.
+
+```rust
+pub async fn plan_re_replication(&self, under: &[(ChunkHandle, Vec<String>, u64)])
+    -> Vec<(ChunkHandle, String, String, u64)>
+{
+    for (handle, locations, version) in under {
+        let target = sorted_servers.iter()
+            .find(|s| !locations.contains(&s.addr));
+        actions.push((*handle, locations[0].clone(), target_addr, *version));
+    }
+    actions
+}
+```
+
+### Execution
+
+The master sends `ReplicateChunk { handle, target }` to the source chunkserver. The source reads the chunk data and version from disk, connects to the target, and sends `ReplicateData`:
+
+```mermaid
+sequenceDiagram
+    participant M as Master
+    participant S as Source CS
+    participant T as Target CS
+
+    Note over M: detect chunk 5 has 1 replica (need 3)
+    Note over M: plan: source=cs1, target=cs2
+
+    M->>S: ReplicateChunk(handle=5, target="cs2:6001")
+    Note over S: read chunk data + version from disk
+    S->>T: ReplicateData(handle=5, data, version)
+    Note over T: store chunk, recompute checksums, set version
+    T-->>S: Ack::Ok
+
+    Note over T: next heartbeat reports chunk 5
+    Note over M: chunk 5 now has 2 locations
+```
+
+The target chunkserver stores the data, recomputes CRC32 checksums from scratch (rather than trusting the source's checksums), and sets the version. On its next heartbeat, the master sees the new location and the chunk moves closer to full replication. If it's still under-replicated, the next 30-second cycle will plan another copy.
+
+### What Can Go Wrong
+
+- **Source unreachable**: the master logs a warning and moves on. The next cycle will retry (possibly picking a different source if the chunk has multiple replicas).
+- **Target unreachable**: the source logs the error. Same retry behavior next cycle.
+- **No available target**: if every chunkserver already holds the chunk, `plan_re_replication` skips it. This happens when you have fewer chunkservers than the replication factor.
+- **All replicas lost**: chunks with 0 locations are skipped by `detect_under_replicated`. This data is unrecoverable -- the GFS paper acknowledges this as the trade-off for lazy replication.
+
 ## Data Integrity
 
 ![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
@@ -889,10 +962,10 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - Shadow master with real-time oplog replication, offset-based catch-up, and client read failover
 - Chunkserver dual heartbeat to primary and shadow masters for location data
 - Shadow auto-reconnect with backlog replay from oplog files
+- Re-replication: automatic detection of under-replicated chunks, master-planned copy to new targets, chunkserver-to-chunkserver data transfer
 
 ## Remaining
 
-- Re-replication for under-replicated chunks
 - Chunk rebalancing across chunkservers
 
 ## References
