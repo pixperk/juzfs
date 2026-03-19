@@ -829,6 +829,86 @@ The target chunkserver stores the data, recomputes CRC32 checksums from scratch 
 - **No available target**: if every chunkserver already holds the chunk, `plan_re_replication` skips it. This happens when you have fewer chunkservers than the replication factor.
 - **All replicas lost**: chunks with 0 locations are skipped by `detect_under_replicated`. This data is unrecoverable -- the GFS paper acknowledges this as the trade-off for lazy replication.
 
+## Chunk Rebalancing
+
+Re-replication fixes urgent problems (under-replicated chunks), but the cluster can still become imbalanced over time. Some chunkservers accumulate more chunks than others due to placement patterns, new servers joining empty, or uneven deletion. The master runs a two-phase rebalancing loop to even things out.
+
+### Detection: Load Imbalance
+
+Every 120 seconds, the master computes the average chunk count across all chunkservers. A server is "overloaded" if it holds more than 120% of the average. A server is "underloaded" if it holds fewer than the average.
+
+```rust
+let total_chunks: usize = servers.values().map(|s| s.chunks.len()).sum();
+let avg = total_chunks as f64 / servers.len() as f64;
+let threshold = (avg * 1.2) as usize;
+```
+
+### Phase 1: Plan and Initiate Moves
+
+For each overloaded server, the master picks chunks to move to underloaded servers. Constraints:
+
+1. **Don't break replication** -- only move chunks that already have `REPLICATION_FACTOR` (3) replicas
+2. **Don't duplicate** -- the target must not already hold the chunk
+3. **Skip pending** -- chunks with an in-flight rebalance move are skipped
+4. **Move only the excess** -- stop after moving enough chunks to bring the source to the threshold
+
+The master sends `ReplicateChunk` to the source (same message as re-replication) and records the move as "pending":
+
+```rust
+m.register_pending_rebalance(handle, source.clone(), target.clone()).await;
+```
+
+At this point, both the source and target have the chunk. The source hasn't deleted anything yet.
+
+### Phase 2: Confirm and Clean Up
+
+On the next cycle (120s later), the master checks each pending move:
+
+- **Target heartbeated the chunk**: confirmed. Remove the source from the chunk's location list and send `DeleteChunks` to the source.
+- **Target hasn't reported it yet**: keep pending, check again next cycle.
+- **Chunk was deleted** (e.g. by GC): clear the pending entry, nothing to do.
+
+```mermaid
+sequenceDiagram
+    participant M as Master
+    participant S as Source CS (overloaded)
+    participant T as Target CS (underloaded)
+
+    Note over M: Phase 1 (cycle N)
+    Note over M: avg=3.3, threshold=4, cs1 has 6 chunks
+    M->>S: ReplicateChunk(handle=5, target="cs2")
+    Note over M: record pending: chunk 5, cs1 -> cs2
+    S->>T: ReplicateData(handle=5, data, version)
+    T-->>S: Ack::Ok
+
+    Note over M: Phase 2 (cycle N+1)
+    Note over T: heartbeat reports chunk 5
+    Note over M: confirm: cs2 has chunk 5
+    Note over M: remove cs1 from chunk 5 locations
+    M->>S: DeleteChunks([5])
+    Note over S: deletes chunk 5 from disk
+```
+
+### Why Two Phases?
+
+The naive approach (replicate then immediately delete from source) is dangerous. If the replication fails silently or the target crashes before its next heartbeat, you've lost a replica. The two-phase approach guarantees:
+
+- The source keeps its copy until the target is **confirmed** via heartbeat
+- If anything goes wrong, the chunk remains fully replicated
+- The worst case is a temporary extra replica (4 copies briefly), which is harmless
+
+### Interaction with Re-Replication
+
+Rebalancing and re-replication share infrastructure (`ReplicateChunk`, `ReplicateData`, `store_replicated_chunk`) but have different triggers:
+
+| | Re-Replication | Rebalancing |
+|---|---|---|
+| **Trigger** | Chunk has < 3 replicas | Server load > 120% avg |
+| **Goal** | Restore replication factor | Even out disk usage |
+| **Frequency** | Every 30s | Every 120s |
+| **Deletes source?** | No (adds a replica) | Yes (moves a replica) |
+| **Safety** | Immediate | Two-phase confirmation |
+
 ## Data Integrity
 
 ![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
@@ -963,10 +1043,7 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - Chunkserver dual heartbeat to primary and shadow masters for location data
 - Shadow auto-reconnect with backlog replay from oplog files
 - Re-replication: automatic detection of under-replicated chunks, master-planned copy to new targets, chunkserver-to-chunkserver data transfer
-
-## Remaining
-
-- Chunk rebalancing across chunkservers
+- Two-phase chunk rebalancing: load imbalance detection, pending move tracking, heartbeat-confirmed deletion from overloaded sources
 
 ## References
 
