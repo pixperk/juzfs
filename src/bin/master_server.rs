@@ -292,6 +292,33 @@ async fn main() {
         }
     });
 
+    // background re-replication: detect under-replicated chunks every 30s
+    let repl_master = Arc::clone(&master);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let under = repl_master.detect_under_replicated().await;
+            if under.is_empty() {
+                continue;
+            }
+            tracing::info!(under_replicated = under.len(), "re-replication: detected under-replicated chunks");
+            let actions = repl_master.plan_re_replication(&under).await;
+            for (handle, source, target, _version) in &actions {
+                tracing::info!(chunk = handle, source = %source, target = %target, "re-replication: instructing source");
+                if let Ok(mut conn) = TcpStream::connect(source).await {
+                    let msg = MasterToChunkServer::ReplicateChunk {
+                        handle: *handle,
+                        target: target.clone(),
+                    };
+                    let _ = send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                } else {
+                    tracing::warn!(chunk = handle, source = %source, "re-replication: source unreachable");
+                }
+            }
+        }
+    });
+
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

@@ -26,6 +26,7 @@ pub struct ChunkServerState {
 }
 
 const CHECKPOINT_THRESHOLD: u64 = 100;
+const REPLICATION_FACTOR: usize = 3;
 
 pub struct Master {
     pub files: Arc<RwLock<HashMap<String, Vec<ChunkHandle>>>>,
@@ -744,5 +745,44 @@ impl Master {
         );
 
         orphaned_chunks
+    }
+
+    /// find chunks with fewer replicas than REPLICATION_FACTOR.
+    /// returns (handle, current_locations, version) for each under-replicated chunk.
+    pub async fn detect_under_replicated(&self) -> Vec<(ChunkHandle, Vec<String>, u64)> {
+        let chunks = self.chunks.read().await;
+        let mut under = Vec::new();
+        for (handle, info) in chunks.iter() {
+            if info.locations.len() < REPLICATION_FACTOR && !info.locations.is_empty() {
+                under.push((*handle, info.locations.clone(), info.version));
+            }
+        }
+        under
+    }
+
+    /// for each under-replicated chunk, pick a target chunkserver that doesn't already
+    /// hold it and has the most available space.
+    /// returns list of (handle, source_addr, target_addr, version) to act on.
+    pub async fn plan_re_replication(
+        &self,
+        under: &[(ChunkHandle, Vec<String>, u64)],
+    ) -> Vec<(ChunkHandle, String, String, u64)> {
+        let servers = self.chunkservers.read().await;
+        let mut sorted: Vec<_> = servers.values().collect();
+        sorted.sort_by(|a, b| b.available_space.cmp(&a.available_space));
+
+        let mut actions = Vec::new();
+        for (handle, locations, version) in under {
+            // pick a target: most space, doesn't already hold this chunk
+            let target = sorted.iter().find(|s| !locations.contains(&s.addr));
+            let target_addr = match target {
+                Some(t) => t.addr.clone(),
+                None => continue, // no available target
+            };
+            // pick source: first location (any live replica works)
+            let source = locations[0].clone();
+            actions.push((*handle, source, target_addr, *version));
+        }
+        actions
     }
 }

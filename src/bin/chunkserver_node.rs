@@ -56,6 +56,47 @@ async fn handle_master_msg(cs: &ChunkServer, payload: &[u8]) {
                 tracing::error!(src, dst, error = %e, "failed to copy chunk");
             }
         }
+        MasterToChunkServer::ReplicateChunk { handle, target } => {
+            tracing::info!(chunk = handle, target = %target, "re-replication: sending chunk to target");
+            match cs.read_chunk_for_replication(handle).await {
+                Ok((data, version)) => {
+                    let msg = ChunkServerToChunkServer::ReplicateData {
+                        handle,
+                        data,
+                        version,
+                    };
+                    match TcpStream::connect(&target).await {
+                        Ok(mut conn) => {
+                            if let Err(e) = send_frame(
+                                &mut conn,
+                                MessageType::ChunkServerToChunkServer,
+                                &msg,
+                            ).await {
+                                tracing::error!(chunk = handle, target = %target, error = %e, "replicate send failed");
+                            } else {
+                                match juzfs::protocol::read_frame::<ChunkServerAck>(&mut conn).await {
+                                    Ok((_, ChunkServerAck::Ok)) => {
+                                        tracing::info!(chunk = handle, target = %target, "re-replication complete");
+                                    }
+                                    Ok((_, ChunkServerAck::Error(e))) => {
+                                        tracing::error!(chunk = handle, target = %target, error = %e, "target rejected chunk");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(chunk = handle, target = %target, error = %e, "replicate ack failed");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(chunk = handle, target = %target, error = %e, "target unreachable");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(chunk = handle, error = %e, "failed to read chunk for replication");
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -281,6 +322,16 @@ async fn handle_cs_msg(stream: &mut TcpStream, cs: &ChunkServer, payload: &[u8])
                 Ok(_) => ChunkServerAck::Ok,
                 Err(e) => {
                     tracing::error!(chunk = handle, error = %e, "commit write failed");
+                    ChunkServerAck::Error(e.to_string())
+                }
+            }
+        }
+        ChunkServerToChunkServer::ReplicateData { handle, data, version } => {
+            tracing::info!(chunk = handle, bytes = data.len(), version, "re-replication: receiving chunk");
+            match cs.store_replicated_chunk(handle, data, version).await {
+                Ok(_) => ChunkServerAck::Ok,
+                Err(e) => {
+                    tracing::error!(chunk = handle, error = %e, "failed to store replicated chunk");
                     ChunkServerAck::Error(e.to_string())
                 }
             }

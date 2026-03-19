@@ -277,6 +277,22 @@ impl ChunkServer {
         Ok(())
     }
 
+    /// read full chunk data + version for sending to another chunkserver during re-replication
+    pub async fn read_chunk_for_replication(&self, handle: ChunkHandle) -> io::Result<(Vec<u8>, u64)> {
+        let data = fs::read(self.chunk_path(handle))?;
+        let version = self.stored_chunks.read().await.get(&handle).copied().unwrap_or(0);
+        Ok((data, version))
+    }
+
+    /// store a chunk received from another chunkserver during re-replication (recomputes checksums)
+    pub async fn store_replicated_chunk(&self, handle: ChunkHandle, data: Vec<u8>, version: u64) -> io::Result<()> {
+        fs::write(self.chunk_path(handle), &data)?;
+        fs::write(self.checksum_path(handle), checksums_to_bytes(&compute_checksums(&data)))?;
+        self.write_version_to_disk(handle, version)?;
+        self.stored_chunks.write().await.insert(handle, version);
+        Ok(())
+    }
+
     /// COW snapshot: locally copy chunk data + checksums from src to dst handle
     pub async fn copy_chunk(&self, src: ChunkHandle, dst: ChunkHandle) -> io::Result<()> {
         fs::copy(self.chunk_path(src), self.chunk_path(dst))?;

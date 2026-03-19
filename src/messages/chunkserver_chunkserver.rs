@@ -26,6 +26,12 @@ pub enum ChunkServerToChunkServer {
         offset: u64,
         serial: u64,
     },
+    /// re-replication: source chunkserver sends full chunk data to a new target
+    ReplicateData {
+        handle: ChunkHandle,
+        data: Vec<u8>,
+        version: u64,
+    },
 }
 
 /// ack from one chunkserver to another
