@@ -909,9 +909,50 @@ Rebalancing and re-replication share infrastructure (`ReplicateChunk`, `Replicat
 | **Deletes source?** | No (adds a replica) | Yes (moves a replica) |
 | **Safety** | Immediate | Two-phase confirmation |
 
-## Data Integrity
+## Consistency Model
 
-![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
+GFS doesn't pretend to be strongly consistent. It makes a deliberate trade-off: relaxed guarantees for writes, strong guarantees where it matters, and a pile of mechanisms to keep everything converging.
+
+![File Region State After Mutation](https://www.pixperk.tech/assets/blog/gfs-3.png)
+
+The paper defines three states for file regions after a mutation:
+
+- **Consistent** -- all replicas have the same data
+- **Defined** -- consistent AND the client can read back exactly what it wrote
+- **Inconsistent** -- replicas diverge (will be repaired by re-replication)
+
+**Writes** (client-specified offset) are defined if successful. The serial number assigned by the primary ensures all replicas apply mutations in the same order. Concurrent writes to the same region can interleave, leaving the region consistent but undefined -- all replicas agree, but the data is a mix.
+
+**Record appends** guarantee the data is written atomically at least once, at an offset the primary chooses. Failed appends can leave padding or partial data on some replicas. The region is "defined interspersed with inconsistent." Applications handle this with checksums in records to detect padding, and unique IDs to deduplicate.
+
+### How consistency is enforced
+
+Four mechanisms work together:
+
+```mermaid
+graph TD
+    A[Client Write/Append] --> B{Primary assigns serial}
+    B --> C[All replicas apply in serial order]
+    C --> D{All succeed?}
+    D -->|Yes| E[Defined: all replicas agree]
+    D -->|No| F[Inconsistent: replicas diverge]
+    F --> G[Version mismatch on heartbeat]
+    G --> H[Stale replica removed from locations]
+    H --> I[Re-replication restores replica count]
+    I --> E
+```
+
+1. **Leases** serialize mutations. The primary holds a 60-second lease on a chunk. All writes for that chunk go through the primary. The primary assigns serial numbers. Replicas obey. Two clients writing concurrently? The primary picks the order.
+
+2. **Version tracking** enforces freshness. Every lease grant bumps the version. Chunkservers persist versions to disk. Stale replicas (lower version than master expects) get removed from the location map. Clients never get sent to them.
+
+3. **Heartbeats** drive convergence. Every 5 seconds, chunkservers report what they have. The master compares versions, removes stale replicas, detects orphans, and triggers re-replication. Given enough heartbeat cycles, the system converges to the correct state.
+
+4. **Re-replication** heals the cluster. Under-replicated chunks get copied to new targets. The fresh copy comes from a good replica, so the new target starts with correct data and the right version.
+
+The consistency model isn't a single feature. It's the emergent behavior of these four mechanisms working together. Each one is simple. The consistency comes from their interaction.
+
+## Data Integrity
 
 Every read goes through checksum verification:
 
