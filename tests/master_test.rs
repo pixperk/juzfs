@@ -750,3 +750,125 @@ async fn test_ns_snapshot_blocks_same_dst_create() {
     // /dst.txt already exists from snapshot
     assert!(m.get_file_chunks("/dst.txt").await.is_some());
 }
+
+// ==================== re-replication tests ====================
+
+#[tokio::test]
+async fn test_detect_under_replicated_with_one_replica() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    let locations = vec!["cs1:6000".to_string()];
+    m.add_chunk("/f.txt", locations).await.unwrap();
+
+    // register cs1 so heartbeat works
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.heartbeat("cs1:6000", vec![(1, 0)], 1_000_000).await;
+
+    let under = m.detect_under_replicated().await;
+    assert_eq!(under.len(), 1);
+    assert_eq!(under[0].0, 1); // handle
+    assert_eq!(under[0].1, vec!["cs1:6000".to_string()]); // locations
+}
+
+#[tokio::test]
+async fn test_detect_under_replicated_fully_replicated() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    let locations = vec![
+        "cs1:6000".to_string(),
+        "cs2:6001".to_string(),
+        "cs3:6002".to_string(),
+    ];
+    m.add_chunk("/f.txt", locations).await.unwrap();
+
+    // register all 3 and heartbeat
+    for (addr, handle) in [("cs1:6000", 1), ("cs2:6001", 1), ("cs3:6002", 1)] {
+        m.register_chunkserver(addr.into(), 1_000_000).await;
+        m.heartbeat(addr, vec![(handle, 0)], 1_000_000).await;
+    }
+
+    let under = m.detect_under_replicated().await;
+    assert!(under.is_empty());
+}
+
+#[tokio::test]
+async fn test_detect_under_replicated_ignores_zero_locations() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    // add chunk with empty locations (simulates all chunkservers dying)
+    m.add_chunk("/f.txt", vec![]).await.unwrap();
+
+    // detect_under_replicated skips chunks with 0 locations (no source to copy from)
+    let under = m.detect_under_replicated().await;
+    assert!(under.is_empty());
+}
+
+#[tokio::test]
+async fn test_plan_re_replication_picks_non_holder() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    let locations = vec!["cs1:6000".to_string()];
+    m.add_chunk("/f.txt", locations).await.unwrap();
+
+    // register 3 chunkservers
+    m.register_chunkserver("cs1:6000".into(), 500_000).await;
+    m.register_chunkserver("cs2:6001".into(), 1_000_000).await;
+    m.register_chunkserver("cs3:6002".into(), 800_000).await;
+
+    m.heartbeat("cs1:6000", vec![(1, 0)], 500_000).await;
+
+    let under = m.detect_under_replicated().await;
+    let actions = m.plan_re_replication(&under).await;
+
+    assert_eq!(actions.len(), 1);
+    let (handle, source, target, _version) = &actions[0];
+    assert_eq!(*handle, 1);
+    assert_eq!(source, "cs1:6000"); // only holder is the source
+    // target should be cs2 (most space) since it doesn't hold the chunk
+    assert_eq!(target, "cs2:6001");
+}
+
+#[tokio::test]
+async fn test_plan_re_replication_skips_when_no_target() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    let locations = vec!["cs1:6000".to_string()];
+    m.add_chunk("/f.txt", locations).await.unwrap();
+
+    // only 1 chunkserver registered, and it already holds the chunk
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.heartbeat("cs1:6000", vec![(1, 0)], 1_000_000).await;
+
+    let under = m.detect_under_replicated().await;
+    let actions = m.plan_re_replication(&under).await;
+
+    // no action because there's no target that doesn't already hold the chunk
+    assert!(actions.is_empty());
+}
+
+#[tokio::test]
+async fn test_plan_re_replication_multiple_under_replicated() {
+    let m = make_master();
+    m.create_file("/a.txt".into()).await.unwrap();
+    m.create_file("/b.txt".into()).await.unwrap();
+    m.add_chunk("/a.txt", vec!["cs1:6000".into()]).await.unwrap();
+    m.add_chunk("/b.txt", vec!["cs2:6001".into()]).await.unwrap();
+
+    m.register_chunkserver("cs1:6000".into(), 1_000_000).await;
+    m.register_chunkserver("cs2:6001".into(), 1_000_000).await;
+    m.register_chunkserver("cs3:6002".into(), 1_000_000).await;
+
+    m.heartbeat("cs1:6000", vec![(1, 0)], 1_000_000).await;
+    m.heartbeat("cs2:6001", vec![(2, 0)], 1_000_000).await;
+
+    let under = m.detect_under_replicated().await;
+    assert_eq!(under.len(), 2);
+
+    let actions = m.plan_re_replication(&under).await;
+    assert_eq!(actions.len(), 2);
+
+    // both chunks should have replication actions planned
+    let handles: Vec<u64> = actions.iter().map(|(h, _, _, _)| *h).collect();
+    assert!(handles.contains(&1));
+    assert!(handles.contains(&2));
+}
