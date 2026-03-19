@@ -478,3 +478,155 @@ async fn test_crash_between_rotate_and_checkpoint() {
     // post-checkpoint file should exist (from current oplog)
     assert!(recovered.get_file_chunks("/after.txt").await.is_some());
 }
+
+// ---- snapshot / COW tests ----
+
+#[tokio::test]
+async fn test_snapshot_creates_copy() {
+    let m = make_master();
+    m.create_file("/src.txt".into()).await.unwrap();
+    m.add_chunk("/src.txt", vec!["cs:9000".into()]).await.unwrap();
+
+    assert!(m.snapshot("/src.txt".into(), "/snap.txt".into()).await.unwrap());
+
+    // both files exist with the same chunk handles
+    let src_chunks = m.get_file_chunks("/src.txt").await.unwrap();
+    let snap_chunks = m.get_file_chunks("/snap.txt").await.unwrap();
+    assert_eq!(src_chunks, snap_chunks);
+
+    // ref_count should be 2 on shared chunks
+    let chunks = m.chunks.read().await;
+    assert_eq!(chunks[&src_chunks[0]].ref_count, 2);
+}
+
+#[tokio::test]
+async fn test_snapshot_revokes_leases() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    m.add_chunk("/f.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.register_chunkserver("cs:9000".into(), 1000).await;
+    m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
+
+    // grant a lease
+    m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
+
+    // snapshot should revoke it
+    m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+
+    let chunks = m.chunks.read().await;
+    assert!(chunks[&1].primary.is_none());
+    assert!(chunks[&1].lease_expiry.is_none());
+}
+
+#[tokio::test]
+async fn test_snapshot_nonexistent_file() {
+    let m = make_master();
+    assert!(!m.snapshot("/nope.txt".into(), "/snap.txt".into()).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_cow_triggers_on_write_to_shared_chunk() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    m.add_chunk("/f.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.register_chunkserver("cs:9000".into(), 1000).await;
+    m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
+
+    // snapshot: both files share chunk 1, ref_count = 2
+    m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+
+    // grant lease on shared chunk -COW should trigger
+    let result = m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
+    let (actual_handle, _primary, _secondaries, _version, _bumped, cow_copy) = result;
+
+    // handle should be different (new chunk allocated)
+    assert_ne!(actual_handle, 1);
+
+    // cow_copy should have the old and new handles
+    let (src, dst, _locs) = cow_copy.unwrap();
+    assert_eq!(src, 1);
+    assert_eq!(dst, actual_handle);
+
+    // /f.txt should now point to the new handle
+    let f_chunks = m.get_file_chunks("/f.txt").await.unwrap();
+    assert_eq!(f_chunks, vec![actual_handle]);
+
+    // /snap.txt should still point to original chunk 1
+    let snap_chunks = m.get_file_chunks("/snap.txt").await.unwrap();
+    assert_eq!(snap_chunks, vec![1]);
+
+    // ref_counts should both be 1 now
+    let chunks = m.chunks.read().await;
+    assert_eq!(chunks[&1].ref_count, 1);
+    assert_eq!(chunks[&actual_handle].ref_count, 1);
+}
+
+#[tokio::test]
+async fn test_no_cow_without_snapshot() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    m.add_chunk("/f.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.register_chunkserver("cs:9000".into(), 1000).await;
+    m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
+
+    // no snapshot, ref_count = 1 -COW should NOT trigger
+    let result = m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
+    let (actual_handle, _, _, _, _, cow_copy) = result;
+
+    assert_eq!(actual_handle, 1); // same handle
+    assert!(cow_copy.is_none());  // no COW
+}
+
+#[tokio::test]
+async fn test_cow_on_second_file() {
+    let m = make_master();
+    m.create_file("/f.txt".into()).await.unwrap();
+    m.add_chunk("/f.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.register_chunkserver("cs:9000".into(), 1000).await;
+    m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
+
+    m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+
+    // COW on /f.txt first
+    let result1 = m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
+    let (new_handle, _, _, _, _, _) = result1;
+
+    // chunk 1 ref_count is back to 1, /snap.txt still points to it
+    // grant lease on chunk 1 through /snap.txt -no COW needed (ref_count = 1)
+    let result2 = m.grant_lease(1, "/snap.txt").await.unwrap().unwrap();
+    let (snap_handle, _, _, _, _, cow_copy) = result2;
+
+    assert_eq!(snap_handle, 1);   // no fork, same handle
+    assert!(cow_copy.is_none());  // no COW since ref_count is 1
+
+    // files diverged
+    let f_chunks = m.get_file_chunks("/f.txt").await.unwrap();
+    let snap_chunks = m.get_file_chunks("/snap.txt").await.unwrap();
+    assert_eq!(f_chunks, vec![new_handle]);
+    assert_eq!(snap_chunks, vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_snapshot_survives_recovery() {
+    let dir = tempdir().unwrap();
+    let oplog_path = dir.path().join("oplog.bin");
+    let path_str = oplog_path.to_str().unwrap();
+
+    {
+        let m = Master::new(60, path_str).unwrap();
+        m.create_file("/f.txt".into()).await.unwrap();
+        m.add_chunk("/f.txt", vec!["cs:9000".into()]).await.unwrap();
+        m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+    }
+
+    let recovered = Master::recover(60, path_str).await.unwrap();
+
+    // both files should exist
+    let f_chunks = recovered.get_file_chunks("/f.txt").await.unwrap();
+    let snap_chunks = recovered.get_file_chunks("/snap.txt").await.unwrap();
+    assert_eq!(f_chunks, snap_chunks);
+
+    // ref_count should be 2
+    let chunks = recovered.chunks.read().await;
+    assert_eq!(chunks[&f_chunks[0]].ref_count, 2);
+}

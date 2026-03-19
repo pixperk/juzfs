@@ -463,7 +463,7 @@ impl Master {
                     info.locations.retain(|l| l != addr);
                 }
             } else {
-                // master doesn't know this chunk — it's orphaned
+                // master doesn't know this chunk, it's orphaned
                 orphaned.push(*handle);
             }
         }

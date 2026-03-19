@@ -275,7 +275,7 @@ impl Client {
             // actual_handle may differ from handle if COW triggered
             let (actual_handle, primary, secondaries) = self.get_primary(handle, filename).await?;
 
-            // COW changed the handle — invalidate cached metadata
+            // COW changed the handle, invalidate cached metadata
             if actual_handle != handle {
                 self.invalidate_cache(filename).await;
             }
