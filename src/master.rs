@@ -1,8 +1,10 @@
 use core::time;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use std::{collections::HashMap, io, path::Path};
+use tokio::sync::{Mutex, RwLock};
+
+use crate::oplog::OpLog;
 
 pub type ChunkHandle = u64;
 
@@ -27,6 +29,7 @@ pub struct Master {
     pub chunkservers: Arc<RwLock<HashMap<String, ChunkServerState>>>,
     pub next_chunk_handle: Arc<RwLock<ChunkHandle>>,
     pub expiry: time::Duration, // lease expiry duration
+    pub oplog: Mutex<OpLog>,    // operation log for durability and recovery
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -46,14 +49,59 @@ pub enum OpLogEntry {
 }
 
 impl Master {
-    pub fn new(expiry_in_seconds: u64) -> Self {
-        Master {
+    /// recover master state from an existing oplog, then reopen it for appending.
+    /// locations and leases are not restored -- chunkservers repopulate via heartbeat.
+    pub async fn recover(expiry_in_seconds: u64, path_str: &str) -> io::Result<Self> {
+        let entries = OpLog::replay(Path::new(path_str)).unwrap_or_default();
+        let master = Master::new(expiry_in_seconds, path_str)?;
+
+        let mut max_handle: ChunkHandle = 0;
+
+        for entry in entries {
+            match entry {
+                OpLogEntry::CreateFile { filename } => {
+                    master.files.write().await.insert(filename, Vec::new());
+                }
+                OpLogEntry::AddChunk { filename, handle } => {
+                    if let Some(chunks_list) = master.files.write().await.get_mut(&filename) {
+                        chunks_list.push(handle);
+                    }
+                    master.chunks.write().await.insert(
+                        handle,
+                        ChunkInfo {
+                            handle,
+                            version: 0,
+                            primary: None,
+                            lease_expiry: None,
+                            locations: Vec::new(),
+                        },
+                    );
+                    max_handle = max_handle.max(handle);
+                }
+                OpLogEntry::GrantLease { handle, version, .. } => {
+                    if let Some(info) = master.chunks.write().await.get_mut(&handle) {
+                        info.version = version;
+                    }
+                }
+            }
+        }
+
+        if max_handle > 0 {
+            *master.next_chunk_handle.write().await = max_handle + 1;
+        }
+
+        Ok(master)
+    }
+
+    pub fn new(expiry_in_seconds: u64, path_str: &str) -> io::Result<Self> {
+        Ok(Master {
             files: Arc::new(RwLock::new(HashMap::new())),
             chunks: Arc::new(RwLock::new(HashMap::new())),
             chunkservers: Arc::new(RwLock::new(HashMap::new())),
             next_chunk_handle: Arc::new(RwLock::new(1)),
             expiry: time::Duration::from_secs(expiry_in_seconds),
-        }
+            oplog: Mutex::new(OpLog::new(Path::new(path_str))?),
+        })
     }
 
     ///allocates a new unique chunkhandle by incrementing a counter. this is used whenever a new chunk is created for a file.
@@ -65,17 +113,29 @@ impl Master {
     }
 
     ///creates a file entry in master metadata
-    pub async fn create_file(&self, filename: String) {
+    pub async fn create_file(&self, filename: String) -> io::Result<()> {
+        let mut oplog = self.oplog.lock().await;
+        oplog.log(&OpLogEntry::CreateFile { filename: filename.clone() })?;
+        drop(oplog);
+
         let mut files = self.files.write().await;
         files.insert(filename, Vec::new());
+        Ok(())
     }
 
     ///allocates a new chunkhandle for a file and updates the master's metadata to reflect the new chunk and its locations. used when a client writes to a file and needs to create a new chunk.
-    pub async fn add_chunk(&self, filename: &str, locations: Vec<String>) -> Option<ChunkHandle> {
+    pub async fn add_chunk(&self, filename: &str, locations: Vec<String>) -> io::Result<Option<ChunkHandle>> {
         let handle = self.allocate_chunk_handle().await;
 
+        let mut oplog = self.oplog.lock().await;
+        oplog.log(&OpLogEntry::AddChunk { filename: filename.to_string(), handle })?;
+        drop(oplog);
+
         let mut files = self.files.write().await;
-        let chunks_list = files.get_mut(filename)?;
+        let chunks_list = match files.get_mut(filename) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
         chunks_list.push(handle);
 
         let info = ChunkInfo {
@@ -89,7 +149,7 @@ impl Master {
         let mut chunks = self.chunks.write().await;
         chunks.insert(handle, info);
 
-        Some(handle)
+        Ok(Some(handle))
     }
 
     ///given a chunkhandle, return the list of chunkservers that hold replicas of that chunk. used by clients to know where to read/write data.
@@ -171,9 +231,12 @@ impl Master {
     pub async fn grant_lease(
         &self,
         handle: ChunkHandle,
-    ) -> Option<(String, Vec<String>, u64, bool)> {
+    ) -> io::Result<Option<(String, Vec<String>, u64, bool)>> {
         let mut chunks = self.chunks.write().await;
-        let info = chunks.get_mut(&handle)?;
+        let info = match chunks.get_mut(&handle) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
 
         // check if existing lease is still valid
         if let (Some(primary), Some(expiry)) = (&info.primary, info.lease_expiry) {
@@ -184,12 +247,15 @@ impl Master {
                     .filter(|l| *l != primary)
                     .cloned()
                     .collect();
-                return Some((primary.clone(), secondaries, info.version, false));
+                return Ok(Some((primary.clone(), secondaries, info.version, false)));
             }
         }
 
         // grant new lease: pick first location as primary, bump version
-        let primary = info.locations.first()?.clone();
+        let primary = match info.locations.first() {
+            Some(p) => p.clone(),
+            None => return Ok(None),
+        };
         info.primary = Some(primary.clone());
         info.version += 1;
         info.lease_expiry = Some(Instant::now() + self.expiry);
@@ -202,6 +268,10 @@ impl Master {
             .cloned()
             .collect();
 
-        Some((primary, secondaries, version, true))
+        let mut oplog = self.oplog.lock().await;
+        oplog.log(&OpLogEntry::GrantLease { handle, primary: primary.clone(), version })?;
+        drop(oplog);
+
+        Ok(Some((primary, secondaries, version, true)))
     }
 }

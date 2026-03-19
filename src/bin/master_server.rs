@@ -37,8 +37,13 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
     let response = match msg {
         ClientToMaster::CreateFile { filename } => {
             tracing::info!(file = %filename, "create file");
-            master.create_file(filename).await;
-            MasterToClient::Ok
+            match master.create_file(filename).await {
+                Ok(()) => MasterToClient::Ok,
+                Err(e) => {
+                    tracing::error!(error = %e, "oplog write failed on create_file");
+                    MasterToClient::Error("internal error".into())
+                }
+            }
         }
         ClientToMaster::GetFileChunks { filename } => {
             match master.get_file_chunks(&filename).await {
@@ -71,7 +76,7 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                 MasterToClient::Error("no chunkservers available".into())
             } else {
                 match master.add_chunk(&filename, locations).await {
-                    Some(handle) => {
+                    Ok(Some(handle)) => {
                         let locs = master.get_chunk_locations(handle).await.unwrap();
                         tracing::info!(file = %filename, chunk = handle, replicas = ?locs, "allocated chunk");
                         MasterToClient::ChunkLocations {
@@ -79,15 +84,19 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                             locations: locs,
                         }
                     }
-                    None => {
+                    Ok(None) => {
                         tracing::warn!(file = %filename, "allocate chunk failed, file not found");
                         MasterToClient::Error("file not found".into())
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "oplog write failed on add_chunk");
+                        MasterToClient::Error("internal error".into())
                     }
                 }
             }
         }
         ClientToMaster::GetPrimary { handle } => match master.grant_lease(handle).await {
-            Some((primary, secondaries, version, version_bumped)) => {
+            Ok(Some((primary, secondaries, version, version_bumped))) => {
                 if version_bumped {
                     tracing::info!(
                         chunk = handle,
@@ -121,9 +130,13 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                     secondaries,
                 }
             }
-            None => {
+            Ok(None) => {
                 tracing::warn!(chunk = handle, "grant lease failed, chunk not found");
                 MasterToClient::Error("chunk not found".into())
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "oplog write failed on grant_lease");
+                MasterToClient::Error("internal error".into())
             }
         },
     };
@@ -182,7 +195,8 @@ async fn main() {
         )
         .init();
 
-    let master = Arc::new(Master::new(60));
+    let master = Arc::new(Master::recover(60, "oplog.bin").await.expect("failed to recover master from oplog"));
+    tracing::info!("master recovered from oplog");
     let listener = match TcpListener::bind("0.0.0.0:5000").await {
         Ok(listener) => listener,
         Err(e) => {

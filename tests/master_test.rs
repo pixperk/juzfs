@@ -1,13 +1,19 @@
 use juzfs::master::Master;
+use tempfile::tempdir;
 
 fn make_master() -> Master {
-    Master::new(60)
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("oplog.bin");
+    let m = Master::new(60, path.to_str().unwrap()).unwrap();
+    // leak the tempdir so it lives as long as the master
+    std::mem::forget(dir);
+    m
 }
 
 #[tokio::test]
 async fn test_create_file_and_get_chunks() {
     let m = make_master();
-    m.create_file("/data/log.txt".into()).await;
+    m.create_file("/data/log.txt".into()).await.unwrap();
 
     let chunks = m.get_file_chunks("/data/log.txt").await;
     assert_eq!(chunks, Some(vec![]));
@@ -26,10 +32,10 @@ async fn test_allocate_chunk_handle_increments() {
 #[tokio::test]
 async fn test_add_chunk_to_file() {
     let m = make_master();
-    m.create_file("/data/log.txt".into()).await;
+    m.create_file("/data/log.txt".into()).await.unwrap();
 
     let locs = vec!["10.0.0.1:9000".into(), "10.0.0.2:9000".into()];
-    let handle = m.add_chunk("/data/log.txt", locs.clone()).await;
+    let handle = m.add_chunk("/data/log.txt", locs.clone()).await.unwrap();
     assert_eq!(handle, Some(1));
 
     let chunks = m.get_file_chunks("/data/log.txt").await;
@@ -42,7 +48,7 @@ async fn test_add_chunk_to_file() {
 #[tokio::test]
 async fn test_add_chunk_to_nonexistent_file() {
     let m = make_master();
-    assert_eq!(m.add_chunk("/nope", vec!["addr".into()]).await, None);
+    assert_eq!(m.add_chunk("/nope", vec!["addr".into()]).await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -91,11 +97,11 @@ async fn test_choose_locations_fewer_servers_than_requested() {
 #[tokio::test]
 async fn test_multiple_chunks_per_file() {
     let m = make_master();
-    m.create_file("/data/big.bin".into()).await;
+    m.create_file("/data/big.bin".into()).await.unwrap();
 
-    m.add_chunk("/data/big.bin", vec!["a:9000".into()]).await;
-    m.add_chunk("/data/big.bin", vec!["b:9000".into()]).await;
-    m.add_chunk("/data/big.bin", vec!["c:9000".into()]).await;
+    m.add_chunk("/data/big.bin", vec!["a:9000".into()]).await.unwrap();
+    m.add_chunk("/data/big.bin", vec!["b:9000".into()]).await.unwrap();
+    m.add_chunk("/data/big.bin", vec!["c:9000".into()]).await.unwrap();
 
     let chunks = m.get_file_chunks("/data/big.bin").await.unwrap();
     assert_eq!(chunks, vec![1, 2, 3]);
@@ -104,8 +110,8 @@ async fn test_multiple_chunks_per_file() {
 #[tokio::test]
 async fn test_lease_expiry_is_set() {
     let m = make_master();
-    m.create_file("/f".into()).await;
-    m.add_chunk("/f", vec!["a:9000".into()]).await;
+    m.create_file("/f".into()).await.unwrap();
+    m.add_chunk("/f", vec!["a:9000".into()]).await.unwrap();
 
     let chunks = m.chunks.read().await;
     let info = &chunks[&1];
@@ -116,14 +122,14 @@ async fn test_lease_expiry_is_set() {
 #[tokio::test]
 async fn test_grant_lease_new() {
     let m = make_master();
-    m.create_file("/f".into()).await;
+    m.create_file("/f".into()).await.unwrap();
     m.add_chunk(
         "/f",
         vec!["a:9000".into(), "b:9000".into(), "c:9000".into()],
     )
-    .await;
+    .await.unwrap();
 
-    let (primary, secondaries, version, bumped) = m.grant_lease(1).await.unwrap();
+    let (primary, secondaries, version, bumped) = m.grant_lease(1).await.unwrap().unwrap();
 
     assert_eq!(primary, "a:9000");
     assert_eq!(secondaries.len(), 2);
@@ -140,16 +146,16 @@ async fn test_grant_lease_new() {
 #[tokio::test]
 async fn test_grant_lease_reuses_existing() {
     let m = make_master();
-    m.create_file("/f".into()).await;
+    m.create_file("/f".into()).await.unwrap();
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
-        .await;
+        .await.unwrap();
 
-    let (p1, _, v1, bumped1) = m.grant_lease(1).await.unwrap();
+    let (p1, _, v1, bumped1) = m.grant_lease(1).await.unwrap().unwrap();
     assert!(bumped1);
     assert_eq!(v1, 1);
 
     // second grant while lease is still active, no version bump
-    let (p2, _, v2, bumped2) = m.grant_lease(1).await.unwrap();
+    let (p2, _, v2, bumped2) = m.grant_lease(1).await.unwrap().unwrap();
     assert_eq!(p1, p2);
     assert_eq!(v1, v2);
     assert!(!bumped2);
@@ -160,17 +166,19 @@ async fn test_grant_lease_reuses_existing() {
 
 #[tokio::test]
 async fn test_grant_lease_expired_regrants() {
-    let m = Master::new(0);
-    m.create_file("/f".into()).await;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("oplog.bin");
+    let m = Master::new(0, path.to_str().unwrap()).unwrap();
+    m.create_file("/f".into()).await.unwrap();
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
-        .await;
+        .await.unwrap();
 
     // first grant: version 0 -> 1
-    let (_, _, v1, _) = m.grant_lease(1).await.unwrap();
+    let (_, _, v1, _) = m.grant_lease(1).await.unwrap().unwrap();
     assert_eq!(v1, 1);
 
     // lease expired immediately, next grant bumps 1 -> 2
-    let (primary, _, v2, bumped) = m.grant_lease(1).await.unwrap();
+    let (primary, _, v2, bumped) = m.grant_lease(1).await.unwrap().unwrap();
     assert_eq!(primary, "a:9000");
     assert_eq!(v2, 2);
     assert!(bumped);
@@ -182,20 +190,20 @@ async fn test_grant_lease_expired_regrants() {
 #[tokio::test]
 async fn test_grant_lease_nonexistent_chunk() {
     let m = make_master();
-    assert!(m.grant_lease(999).await.is_none());
+    assert!(m.grant_lease(999).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn test_heartbeat_detects_stale_replica() {
     let m = make_master();
-    m.create_file("/f".into()).await;
+    m.create_file("/f".into()).await.unwrap();
     m.register_chunkserver("a:9000".into(), 1000).await;
     m.register_chunkserver("b:9000".into(), 1000).await;
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
-        .await;
+        .await.unwrap();
 
     // grant lease bumps version to 1
-    let (_, _, version, _) = m.grant_lease(1).await.unwrap();
+    let (_, _, version, _) = m.grant_lease(1).await.unwrap().unwrap();
     assert_eq!(version, 1);
 
     // "a" reports current version, "b" reports stale version
