@@ -215,13 +215,14 @@ Once removed, the stale chunkserver is invisible to clients. No reads or writes 
 
 The operation log (oplog) is how the master survives crashes. Every metadata mutation is written to an append-only log on disk before it is applied to memory. If the master crashes, it replays the log on startup and reconstructs its state.
 
-The oplog records three types of mutations:
+The oplog records four types of mutations:
 
 ```rust
 pub enum OpLogEntry {
     CreateFile { filename: String },
     AddChunk { filename: String, handle: ChunkHandle },
     GrantLease { handle: ChunkHandle, primary: String, version: u64 },
+    DeleteFile { filename: String, hidden_name: String },
 }
 ```
 
@@ -258,6 +259,7 @@ pub struct Checkpoint {
     pub files: HashMap<String, Vec<ChunkHandle>>,
     pub chunks: HashMap<ChunkHandle, u64>,  // handle -> version
     pub next_chunk_handle: ChunkHandle,
+    pub deleted_files: HashMap<String, (String, u64)>,  // hidden_name -> (original, timestamp)
 }
 ```
 
@@ -304,6 +306,80 @@ The checkpoint triggers after every 100 oplog entries (configurable via `CHECKPO
 2. Replay `oplog.old.bin` if it exists (crash between rotate and checkpoint)
 3. Replay `oplog.bin` (entries written after the last checkpoint)
 4. Wait for chunkserver heartbeats to repopulate locations
+
+## Garbage Collection
+
+![Garbage Collection Flow](https://www.pixperk.tech/assets/blog/gfs-7.jpg)
+
+GFS doesn't immediately free storage when a file is deleted. Instead, it uses a lazy, three-phase approach that is simpler and more reliable than eager deletion.
+
+### Step 1: Lazy Deletion
+
+When a client deletes a file, the master doesn't remove anything. It renames the file to a hidden name with a deletion timestamp and logs the operation:
+
+```rust
+pub async fn delete_file(&self, filename: String) -> io::Result<bool> {
+    // rename /foo.txt -> /.deleted_foo.txt
+    let hidden = format!("/.deleted_{}", filename.trim_start_matches('/'));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+    // log before mutating
+    oplog.log(&OpLogEntry::DeleteFile {
+        filename: filename.clone(),
+        hidden_name: hidden.clone(),
+    })?;
+
+    // move chunks from original name to hidden name
+    if let Some(handles) = files.remove(&filename) {
+        files.insert(hidden.clone(), handles);
+    }
+    deleted_files.insert(hidden, (filename, now));
+    Ok(true)
+}
+```
+
+The file is invisible to clients immediately, but its chunks still exist on disk. This gives a recovery window -- if the delete was accidental, the hidden file could be undeleted before the next GC pass.
+
+### Step 2: Background Sweep
+
+A background task runs every 60 seconds, scanning the `deleted_files` map for entries past the retention window (5 minutes). Expired entries are reaped: their chunk metadata is removed from the master, and the orphaned chunk handles are collected.
+
+```rust
+pub async fn gc_sweep(&self, retention_secs: u64) -> Vec<ChunkHandle> {
+    let expired: Vec<_> = deleted.iter()
+        .filter(|(_, (_, ts))| now - ts >= retention_secs)
+        .collect();
+
+    for (hidden_name, _) in &expired {
+        if let Some(handles) = files.remove(hidden_name) {
+            for h in handles {
+                chunks.remove(&h);
+                orphaned_chunks.push(h);
+            }
+        }
+        deleted.remove(hidden_name);
+    }
+    orphaned_chunks
+}
+```
+
+### Step 3: Heartbeat-Driven Chunk Cleanup
+
+After the master removes chunk metadata, chunkservers still have the data on disk. On the next heartbeat, when a chunkserver reports a chunk handle the master doesn't recognize, the master replies with `DeleteChunks`:
+
+```rust
+// in heartbeat(): master doesn't know this chunk — it's orphaned
+if chunk_map.get(handle).is_none() {
+    orphaned.push(*handle);
+}
+
+// master replies:
+MasterToChunkServer::DeleteChunks(orphaned)
+```
+
+The chunkserver receives this and deletes the chunk files from disk. No separate protocol, no extra coordination -- the existing heartbeat loop handles everything.
+
+This three-phase design means deletion never blocks the client, orphaned storage is reclaimed automatically, and a crash at any point is safe: the oplog and checkpoint preserve the `deleted_files` state, and the heartbeat cycle will eventually clean up chunkserver storage.
 
 ## Data Integrity
 
@@ -372,6 +448,7 @@ commands:
   read   <path> [offset] [length]
   append <path> <data>         record append
   stream <path>                streaming read
+  delete <path>                lazy delete (GC reclaims later)
 ```
 
 ### Chunkserver
@@ -411,15 +488,13 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - Client metadata caching (30s staleness window)
 - Streaming reads with 4-chunk async buffer
 - Chunkserver recovery on restart (scans chunks, checksums, versions from disk)
-- CLI client with create, write, read, append, stream commands
+- CLI client with create, write, read, append, stream, delete commands
+- Garbage collection: lazy deletion, background sweep with configurable retention, heartbeat-driven chunk cleanup
 
 ## Remaining
 
-![Garbage Collection Flow](https://www.pixperk.tech/assets/blog/gfs-7.jpg)
-
 - Re-replication for under-replicated chunks
 - Chunk rebalancing across chunkservers
-- Garbage collection (lazy delete, heartbeat-driven cleanup -- see diagram above)
 - Copy-on-write snapshots
 - Namespace locking for concurrent operations
 
