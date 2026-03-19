@@ -173,7 +173,7 @@ async fn handle_chunkserver_msg(stream: &mut TcpStream, master: &Master, payload
         } => {
             tracing::debug!(
                 chunkserver = %addr,
-                chunks = chunks.len(),
+                chunks = ?chunks,
                 available_mb = available_space / (1024 * 1024),
                 "heartbeat"
             );

@@ -52,15 +52,30 @@ impl Master {
     /// recover master state from an existing oplog, then reopen it for appending.
     /// locations and leases are not restored -- chunkservers repopulate via heartbeat.
     pub async fn recover(expiry_in_seconds: u64, path_str: &str) -> io::Result<Self> {
-        let entries = OpLog::replay(Path::new(path_str)).unwrap_or_default();
+        let entries = match OpLog::replay(Path::new(path_str)) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                tracing::info!("no oplog found, starting fresh");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "oplog replay failed, starting fresh");
+                Vec::new()
+            }
+        };
+
+        let entry_count = entries.len();
         let master = Master::new(expiry_in_seconds, path_str)?;
 
         let mut max_handle: ChunkHandle = 0;
+        let mut files_recovered = 0u64;
+        let mut chunks_recovered = 0u64;
 
         for entry in entries {
             match entry {
                 OpLogEntry::CreateFile { filename } => {
                     master.files.write().await.insert(filename, Vec::new());
+                    files_recovered += 1;
                 }
                 OpLogEntry::AddChunk { filename, handle } => {
                     if let Some(chunks_list) = master.files.write().await.get_mut(&filename) {
@@ -77,6 +92,7 @@ impl Master {
                         },
                     );
                     max_handle = max_handle.max(handle);
+                    chunks_recovered += 1;
                 }
                 OpLogEntry::GrantLease { handle, version, .. } => {
                     if let Some(info) = master.chunks.write().await.get_mut(&handle) {
@@ -89,6 +105,14 @@ impl Master {
         if max_handle > 0 {
             *master.next_chunk_handle.write().await = max_handle + 1;
         }
+
+        tracing::info!(
+            entries = entry_count,
+            files = files_recovered,
+            chunks = chunks_recovered,
+            next_handle = max_handle + 1,
+            "oplog recovery complete"
+        );
 
         Ok(master)
     }

@@ -292,9 +292,7 @@ impl ChunkServer {
     pub async fn update_version(&self, handle: ChunkHandle, version: u64) -> io::Result<()> {
         self.write_version_to_disk(handle, version)?;
         let mut stored = self.stored_chunks.write().await;
-        if let Some(v) = stored.get_mut(&handle) {
-            *v = version;
-        }
+        stored.insert(handle, version);
         Ok(())
     }
 
