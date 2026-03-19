@@ -139,6 +139,20 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                 MasterToClient::Error("internal error".into())
             }
         },
+        ClientToMaster::DeleteFile { filename } => {
+            tracing::info!(file = %filename, "delete file");
+            match master.delete_file(filename).await {
+                Ok(true) => MasterToClient::Ok,
+                Ok(false) => {
+                    tracing::warn!("delete failed, file not found");
+                    MasterToClient::Error("file not found".into())
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "oplog write failed on delete_file");
+                    MasterToClient::Error("internal error".into())
+                }
+            }
+        }
     };
 
     let _ = send_frame(stream, MessageType::MasterToClient, &response).await;

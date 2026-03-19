@@ -9,6 +9,7 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("commands:");
     eprintln!("  create <path>           create file and allocate first chunk");
+    eprintln!("  delete <path>           delete file (lazy, GC cleans up later)");
     eprintln!("  write  <path> <offset> <data>");
     eprintln!("  read   <path> [off] [len]");
     eprintln!("  append <path> <data>    record append");
@@ -54,6 +55,7 @@ async fn main() {
 
     let result = match args[0].as_str() {
         "create" => cmd_create(&client, &args[1..]).await,
+        "delete" => cmd_delete(&client, &args[1..]).await,
         "write" => cmd_write(&client, &args[1..]).await,
         "read" => cmd_read(&client, &args[1..], chunk_size).await,
         "append" => cmd_append(&client, &args[1..]).await,
@@ -72,6 +74,13 @@ async fn cmd_create(client: &Client, args: &[String]) -> std::io::Result<()> {
     client.create_file(path).await?;
     client.allocate_chunk(path).await?;
     println!("{}", path);
+    Ok(())
+}
+
+async fn cmd_delete(client: &Client, args: &[String]) -> std::io::Result<()> {
+    let path = args.first().unwrap_or_else(|| usage());
+    client.delete_file(path).await?;
+    println!("deleted {}", path);
     Ok(())
 }
 

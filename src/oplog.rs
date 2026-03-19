@@ -20,6 +20,9 @@ pub struct Checkpoint {
     pub files: HashMap<String, Vec<ChunkHandle>>,
     pub chunks: HashMap<ChunkHandle, u64>,
     pub next_chunk_handle: ChunkHandle,
+    /// deleted files pending GC: hidden_name -> (original_name, deletion_timestamp)
+    #[serde(default)]
+    pub deleted_files: HashMap<String, (String, u64)>,
 }
 
 impl OpLog {

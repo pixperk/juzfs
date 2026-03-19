@@ -54,6 +54,28 @@ impl Client {
         }
     }
 
+    /// delete a file (lazy -- master renames to hidden name, GC cleans up later)
+    pub async fn delete_file(&self, filename: &str) -> io::Result<()> {
+        let mut conn = TcpStream::connect(&self.master_addr).await?;
+        send_frame(
+            &mut conn,
+            MessageType::ClientToMaster,
+            &ClientToMaster::DeleteFile {
+                filename: filename.to_string(),
+            },
+        )
+        .await?;
+        let (_, resp): (u8, MasterToClient) = read_frame(&mut conn).await?;
+        match resp {
+            MasterToClient::Ok => Ok(()),
+            MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
+        }
+    }
+
     /// ask master to allocate a new chunk for a file, returns (handle, locations)
     pub async fn allocate_chunk(&self, filename: &str) -> io::Result<(ChunkHandle, Vec<String>)> {
         let mut conn = TcpStream::connect(&self.master_addr).await?;

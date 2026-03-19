@@ -16,6 +16,8 @@ pub enum ClientToMaster {
     AllocateChunk { filename: String },
     /// ask master who the primary is for a chunk (master grants lease if none active)
     GetPrimary { handle: ChunkHandle },
+    /// lazy delete a file (renames to hidden name, GC cleans up later)
+    DeleteFile { filename: String },
 }
 
 /// responses the master sends back to the client

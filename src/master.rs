@@ -30,6 +30,8 @@ pub struct Master {
     pub chunks: Arc<RwLock<HashMap<ChunkHandle, ChunkInfo>>>,
     pub chunkservers: Arc<RwLock<HashMap<String, ChunkServerState>>>,
     pub next_chunk_handle: Arc<RwLock<ChunkHandle>>,
+    /// deleted files awaiting garbage collection: hidden_name -> (original_name, deletion_timestamp)
+    pub deleted_files: Arc<RwLock<HashMap<String, (String, u64)>>>,
     pub expiry: time::Duration,
     pub oplog: Mutex<OpLog>,
     oplog_path: String,
@@ -49,6 +51,11 @@ pub enum OpLogEntry {
         handle: ChunkHandle,
         primary: String,
         version: u64,
+    },
+    DeleteFile {
+        filename: String,
+        hidden_name: String,
+        timestamp: u64,
     },
 }
 
@@ -92,6 +99,7 @@ impl Master {
                 }
                 *master.next_chunk_handle.write().await = cp.next_chunk_handle;
                 max_handle = max_handle.max(cp.next_chunk_handle.saturating_sub(1));
+                *master.deleted_files.write().await = cp.deleted_files;
                 tracing::info!(
                     files = files_recovered,
                     chunks = chunks_recovered,
@@ -165,6 +173,7 @@ impl Master {
             chunks: Arc::new(RwLock::new(HashMap::new())),
             chunkservers: Arc::new(RwLock::new(HashMap::new())),
             next_chunk_handle: Arc::new(RwLock::new(1)),
+            deleted_files: Arc::new(RwLock::new(HashMap::new())),
             expiry: time::Duration::from_secs(expiry_in_seconds),
             oplog: Mutex::new(OpLog::new(Path::new(path_str))?),
             oplog_path: path_str.to_string(),
@@ -219,6 +228,22 @@ impl Master {
                     info.version = version;
                 }
             }
+            OpLogEntry::DeleteFile {
+                filename,
+                hidden_name,
+                timestamp,
+            } => {
+                let mut files = master.files.write().await;
+                if let Some(chunks) = files.remove(&filename) {
+                    files.insert(hidden_name.clone(), chunks);
+                }
+                drop(files);
+                master
+                    .deleted_files
+                    .write()
+                    .await
+                    .insert(hidden_name, (filename, timestamp));
+            }
         }
     }
 
@@ -245,6 +270,43 @@ impl Master {
             tracing::error!(error = %e, "checkpoint failed");
         }
         Ok(())
+    }
+
+    /// lazy delete: rename file to a hidden name with a deletion timestamp.
+    /// the file's chunks are not removed yet -- a background GC scan will clean them up
+    /// after the retention window expires.
+    pub async fn delete_file(&self, filename: String) -> io::Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let hidden_name = format!("/.deleted_{}", filename.trim_start_matches('/'));
+
+        let mut oplog = self.oplog.lock().await;
+        oplog.log(&OpLogEntry::DeleteFile {
+            filename: filename.clone(),
+            hidden_name: hidden_name.clone(),
+            timestamp: now,
+        })?;
+        drop(oplog);
+
+        let mut files = self.files.write().await;
+        let chunks = match files.remove(&filename) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+        // move the file entry under the hidden name so it can be undeleted
+        files.insert(hidden_name.clone(), chunks);
+        drop(files);
+
+        let mut deleted = self.deleted_files.write().await;
+        deleted.insert(hidden_name, (filename, now));
+        drop(deleted);
+
+        if let Err(e) = self.maybe_checkpoint().await {
+            tracing::error!(error = %e, "checkpoint failed");
+        }
+        Ok(true)
     }
 
     ///allocates a new chunkhandle for a file and updates the master's metadata to reflect the new chunk and its locations. used when a client writes to a file and needs to create a new chunk.
@@ -443,10 +505,13 @@ impl Master {
             .collect();
         let next_handle = *self.next_chunk_handle.read().await;
 
+        let deleted_files = self.deleted_files.read().await.clone();
+
         let cp = Checkpoint {
             files,
             chunks: chunks_map,
             next_chunk_handle: next_handle,
+            deleted_files,
         };
 
         // step 3: write checkpoint + delete old log in background (blocking I/O)
