@@ -29,6 +29,22 @@ pub struct Master {
     pub expiry: time::Duration, // lease expiry duration
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum OpLogEntry {
+    CreateFile {
+        filename: String,
+    },
+    AddChunk {
+        filename: String,
+        handle: ChunkHandle,
+    },
+    GrantLease {
+        handle: ChunkHandle,
+        primary: String,
+        version: u64,
+    },
+}
+
 impl Master {
     pub fn new(expiry_in_seconds: u64) -> Self {
         Master {
@@ -105,7 +121,12 @@ impl Master {
     /// processes heartbeat from a chunkserver, rebuilds chunk locations,
     /// and detects stale replicas by comparing reported version against master's version.
     /// stale replicas are not added to locations, so clients never get sent to them.
-    pub async fn heartbeat(&self, addr: &str, chunks: Vec<(ChunkHandle, u64)>, available_space: u64) {
+    pub async fn heartbeat(
+        &self,
+        addr: &str,
+        chunks: Vec<(ChunkHandle, u64)>,
+        available_space: u64,
+    ) {
         let mut servers = self.chunkservers.write().await;
         if let Some(server) = servers.get_mut(addr) {
             server.last_heartbeat = Instant::now();
@@ -147,7 +168,10 @@ impl Master {
     /// version_bumped is true when a new lease was granted (version incremented),
     /// meaning the caller should notify all replicas to update their version.
     /// when reusing an existing lease, version_bumped is false.
-    pub async fn grant_lease(&self, handle: ChunkHandle) -> Option<(String, Vec<String>, u64, bool)> {
+    pub async fn grant_lease(
+        &self,
+        handle: ChunkHandle,
+    ) -> Option<(String, Vec<String>, u64, bool)> {
         let mut chunks = self.chunks.write().await;
         let info = chunks.get_mut(&handle)?;
 

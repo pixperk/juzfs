@@ -2,6 +2,7 @@ pub mod chunkserver;
 pub mod client;
 pub mod master;
 pub mod messages;
+pub mod oplog;
 pub mod protocol;
 
 /// default chunk size: 64MB (same as GFS)
