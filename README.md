@@ -564,22 +564,6 @@ For an operation on `/d1/d2/leaf`:
 - **Read locks** on all ancestors: `/d1`, `/d1/d2`
 - **Read or write lock** on the leaf, depending on the operation type
 
-```mermaid
-graph TD
-    subgraph "create /home/a.txt"
-        A1["read lock /home"] --> A2["write lock /home/a.txt"]
-    end
-    subgraph "create /home/b.txt"
-        B1["read lock /home"] --> B2["write lock /home/b.txt"]
-    end
-    subgraph "delete /home"
-        C1["write lock /home"]
-    end
-
-    A1 -.->|"compatible"| B1
-    A1 -.->|"conflicts"| C1
-```
-
 Two clients creating `/home/a.txt` and `/home/b.txt` both read-lock `/home` (compatible) and write-lock different leaf paths (no conflict). But creating a file under `/home` conflicts with deleting `/home` itself, because one needs a read lock and the other a write lock on the same path.
 
 The implementation uses a `NamespaceLock` with lazily-created per-path `RwLock`s:

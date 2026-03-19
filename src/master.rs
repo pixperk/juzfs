@@ -2,7 +2,7 @@ use core::time;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{collections::HashMap, io, path::Path};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::namespace::NamespaceLock;
 use crate::oplog::{Checkpoint, OpLog, load_checkpoint, write_checkpoint};
@@ -39,6 +39,8 @@ pub struct Master {
     oplog_path: String,
     checkpoint_path: String,
     pub ns_lock: NamespaceLock,
+    /// broadcast channel for streaming oplog entries to shadow masters
+    pub oplog_tx: broadcast::Sender<Vec<u8>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -187,7 +189,22 @@ impl Master {
             oplog_path: path_str.to_string(),
             checkpoint_path,
             ns_lock: NamespaceLock::new(),
+            oplog_tx: broadcast::channel(1024).0,
         })
+    }
+
+    /// log an entry to oplog and broadcast to shadow masters
+    async fn log_and_broadcast(&self, entry: &OpLogEntry) -> io::Result<()> {
+        let bytes = bincode::serialize(entry)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("serialize: {}", e)))?;
+
+        let mut oplog = self.oplog.lock().await;
+        oplog.log(entry)?;
+        drop(oplog);
+
+        // best-effort broadcast to shadows (don't fail the operation if no shadows connected)
+        let _ = self.oplog_tx.send(bytes);
+        Ok(())
     }
 
     fn load_oplog(path: &Path) -> Vec<OpLogEntry> {
@@ -280,11 +297,9 @@ impl Master {
     ///creates a file entry in master metadata
     pub async fn create_file(&self, filename: String) -> io::Result<()> {
         let _ns = self.ns_lock.lock_mutate(&filename).await;
-        let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::CreateFile {
+        self.log_and_broadcast(&OpLogEntry::CreateFile {
             filename: filename.clone(),
-        })?;
-        drop(oplog);
+        }).await?;
 
         let mut files = self.files.write().await;
         files.insert(filename, Vec::new());
@@ -306,13 +321,11 @@ impl Master {
             .as_secs();
         let hidden_name = format!("/.deleted_{}", filename.trim_start_matches('/'));
 
-        let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::DeleteFile {
+        self.log_and_broadcast(&OpLogEntry::DeleteFile {
             filename: filename.clone(),
             hidden_name: hidden_name.clone(),
             timestamp: now,
-        })?;
-        drop(oplog);
+        }).await?;
 
         let mut files = self.files.write().await;
         let chunks = match files.remove(&filename) {
@@ -338,12 +351,10 @@ impl Master {
     pub async fn snapshot(&self, src: String, dst: String) -> io::Result<bool> {
         let _ns_src = self.ns_lock.lock_read(&src).await;
         let _ns_dst = self.ns_lock.lock_mutate(&dst).await;
-        let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::Snapshot {
+        self.log_and_broadcast(&OpLogEntry::Snapshot {
             src: src.clone(),
             dst: dst.clone(),
-        })?;
-        drop(oplog);
+        }).await?;
 
         let mut files = self.files.write().await;
         let handles = match files.get(&src).cloned() {
@@ -379,12 +390,10 @@ impl Master {
         let _ns = self.ns_lock.lock_mutate(filename).await;
         let handle = self.allocate_chunk_handle().await;
 
-        let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::AddChunk {
+        self.log_and_broadcast(&OpLogEntry::AddChunk {
             filename: filename.to_string(),
             handle,
-        })?;
-        drop(oplog);
+        }).await?;
 
         let mut files = self.files.write().await;
         let chunks_list = match files.get_mut(filename) {
@@ -597,13 +606,11 @@ impl Master {
 
         drop(chunks);
 
-        let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::GrantLease {
+        self.log_and_broadcast(&OpLogEntry::GrantLease {
             handle,
             primary: primary.clone(),
             version,
-        })?;
-        drop(oplog);
+        }).await?;
 
         // build cow copy info: (src_handle, dst_handle, locations)
         let cow_copy = cow_info.map(|(old_handle, locs)| (old_handle, handle, locs));
