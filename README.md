@@ -1,6 +1,6 @@
 # juzfs
 
-A distributed file system in Rust, based on the [Google File System paper](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf). Built from scratch with raw TCP and bincode serialization.
+A complete implementation of the [Google File System](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) in Rust. Raw TCP, no frameworks, no shortcuts. Built in 5 days on almost no sleep because once you start implementing a distributed file system, you can't really stop.
 
 For a detailed breakdown of the GFS architecture, see [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown).
 
@@ -1015,37 +1015,30 @@ RUST_LOG=info cargo run --bin master-server    # default: file ops, leases, regi
 RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavior
 ```
 
-## Implemented
+## What's in the Box
 
-- Single master with in-memory metadata (namespace, chunks, leases)
-- Operation log for crash recovery (append-only, length-prefixed bincode)
-- GFS-style checkpointing (log rotation, background snapshot, atomic write)
-- Recovery from checkpoint + oplog replay on startup
-- Chunkservers with disk persistence, CRC32 checksums per 64KB block, version tracking
-- Custom TCP protocol with magic bytes and bincode serialization
-- Two-phase writes: pipelined data push through chunkserver chain, then primary-coordinated commit
-- Chain error propagation (ForwardData failures bubble back to client)
-- Mutation ordering via monotonic serial numbers on the primary
-- Record append with chunk overflow detection, padding, and transparent retry
-- 60-second write leases with version bump on renewal
-- Stale replica detection via version comparison on heartbeat
-- Master notifies replicas of version updates on lease grant
-- Location rebuild from heartbeats (no persisted chunk locations)
-- Available space tracking from real disk usage
-- Client metadata caching (30s staleness window)
-- Streaming reads with 4-chunk async buffer
-- Chunkserver recovery on restart (scans chunks, checksums, versions from disk)
-- CLI client with create, write, read, append, stream, delete, snapshot commands
-- Garbage collection: lazy deletion, background sweep with configurable retention, heartbeat-driven chunk cleanup
-- Copy-on-write snapshots with reference counting, lease revocation, and handle propagation
-- Namespace locking with per-path read/write locks for concurrent operations
-- Shadow master with real-time oplog replication, offset-based catch-up, and client read failover
-- Chunkserver dual heartbeat to primary and shadow masters for location data
-- Shadow auto-reconnect with backlog replay from oplog files
-- Re-replication: automatic detection of under-replicated chunks, master-planned copy to new targets, chunkserver-to-chunkserver data transfer
-- Two-phase chunk rebalancing: load imbalance detection, pending move tracking, heartbeat-confirmed deletion from overloaded sources
+Everything from the GFS paper, implemented and working:
+
+| Feature | Details |
+|---------|---------|
+| **Master** | Single metadata server, in-memory state behind `RwLock`s, never touches data path |
+| **Chunkservers** | Disk persistence, CRC32 per 64KB block, version tracking, recovery on restart |
+| **Protocol** | Custom TCP framing with magic bytes `0x4A46`, bincode serialization, 8 message types |
+| **Writes** | Two-phase: pipelined data push through chain, then primary-coordinated commit with serial ordering |
+| **Record Append** | Chunk overflow detection, padding on all replicas, transparent retry to new chunk |
+| **Leases** | 60-second write leases, version bump on renewal, stale replica detection via heartbeat |
+| **Operation Log** | Append-only, length-prefixed, flushed before mutation is visible to clients |
+| **Checkpointing** | Log rotation + background snapshot + atomic write, recovers from checkpoint + oplog replay |
+| **Garbage Collection** | Lazy deletion with hidden rename, background sweep (5 min retention), heartbeat-driven chunk cleanup |
+| **COW Snapshots** | Reference counting, lease revocation, deferred fork on first write, handle propagation across master/client/chunkserver |
+| **Namespace Locking** | Per-path hierarchical locks (read on ancestors, write on leaf), deadlock-free by construction |
+| **Shadow Master** | Real-time oplog broadcast, offset-based catch-up from disk, client read failover, auto-reconnect |
+| **Re-Replication** | Background detection of under-replicated chunks, master-planned copy, chunkserver-to-chunkserver transfer |
+| **Chunk Rebalancing** | Two-phase: replicate to underloaded target, confirm via heartbeat, then delete from overloaded source |
+
+Plus: client metadata caching (30s window), streaming reads with 4-chunk async buffer, chunkserver dual heartbeat to primary + shadows, chain error propagation, available space tracking from real disk usage.
 
 ## References
 
 - [The Google File System (2003)](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) -- Ghemawat, Gobioff, and Leung
-- [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown) -- blog this implementation follows
+- [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown) -- my blog post that started this rabbit hole
