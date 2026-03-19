@@ -18,7 +18,7 @@ pub struct OpLog {
 #[derive(Serialize, Deserialize)]
 pub struct Checkpoint {
     pub files: HashMap<String, Vec<ChunkHandle>>,
-    pub chunks: HashMap<ChunkHandle, u64>,
+    pub chunks: HashMap<ChunkHandle, (u64, u64)>, // handle -> (version, ref_count)
     pub next_chunk_handle: ChunkHandle,
     /// deleted files pending GC: hidden_name -> (original_name, deletion_timestamp)
     #[serde(default)]

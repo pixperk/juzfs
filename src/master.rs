@@ -14,6 +14,7 @@ pub struct ChunkInfo {
     pub primary: Option<String>, // chunkserver addr holding the write lease
     pub lease_expiry: Option<Instant>, // GFS uses ~60s leases
     pub locations: Vec<String>,  // chunkserver addrs holding replicas
+    pub ref_count: u64,          // COW snapshots: >1 means shared, copy on write
 }
 
 pub struct ChunkServerState {
@@ -85,7 +86,7 @@ impl Master {
                         chunks_recovered += 1;
                     }
                 }
-                for (&handle, &version) in &cp.chunks {
+                for (&handle, &(version, ref_count)) in &cp.chunks {
                     master.chunks.write().await.insert(
                         handle,
                         ChunkInfo {
@@ -94,6 +95,7 @@ impl Master {
                             primary: None,
                             lease_expiry: None,
                             locations: Vec::new(),
+                            ref_count,
                         },
                     );
                 }
@@ -216,6 +218,7 @@ impl Master {
                         primary: None,
                         lease_expiry: None,
                         locations: Vec::new(),
+                        ref_count: 1,
                     },
                 );
                 *max_handle = (*max_handle).max(handle);
@@ -337,6 +340,7 @@ impl Master {
             primary: None,
             lease_expiry: None,
             locations: locations.clone(),
+            ref_count: 1,
         };
 
         let mut chunks = self.chunks.write().await;
@@ -502,12 +506,12 @@ impl Master {
 
         // step 2: snapshot current state (reads don't block mutations)
         let files = self.files.read().await.clone();
-        let chunks_map: HashMap<ChunkHandle, u64> = self
+        let chunks_map: HashMap<ChunkHandle, (u64, u64)> = self
             .chunks
             .read()
             .await
             .iter()
-            .map(|(&h, info)| (h, info.version))
+            .map(|(&h, info)| (h, (info.version, info.ref_count)))
             .collect();
         let next_handle = *self.next_chunk_handle.read().await;
 
