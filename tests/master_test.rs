@@ -48,7 +48,10 @@ async fn test_add_chunk_to_file() {
 #[tokio::test]
 async fn test_add_chunk_to_nonexistent_file() {
     let m = make_master();
-    assert_eq!(m.add_chunk("/nope", vec!["addr".into()]).await.unwrap(), None);
+    assert_eq!(
+        m.add_chunk("/nope", vec!["addr".into()]).await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -99,9 +102,15 @@ async fn test_multiple_chunks_per_file() {
     let m = make_master();
     m.create_file("/data/big.bin".into()).await.unwrap();
 
-    m.add_chunk("/data/big.bin", vec!["a:9000".into()]).await.unwrap();
-    m.add_chunk("/data/big.bin", vec!["b:9000".into()]).await.unwrap();
-    m.add_chunk("/data/big.bin", vec!["c:9000".into()]).await.unwrap();
+    m.add_chunk("/data/big.bin", vec!["a:9000".into()])
+        .await
+        .unwrap();
+    m.add_chunk("/data/big.bin", vec!["b:9000".into()])
+        .await
+        .unwrap();
+    m.add_chunk("/data/big.bin", vec!["c:9000".into()])
+        .await
+        .unwrap();
 
     let chunks = m.get_file_chunks("/data/big.bin").await.unwrap();
     assert_eq!(chunks, vec![1, 2, 3]);
@@ -127,9 +136,11 @@ async fn test_grant_lease_new() {
         "/f",
         vec!["a:9000".into(), "b:9000".into(), "c:9000".into()],
     )
-    .await.unwrap();
+    .await
+    .unwrap();
 
-    let (_h, primary, secondaries, version, bumped, _cow) = m.grant_lease(1, "/f").await.unwrap().unwrap();
+    let (_h, primary, secondaries, version, bumped, _cow) =
+        m.grant_lease(1, "/f").await.unwrap().unwrap();
 
     assert_eq!(primary, "a:9000");
     assert_eq!(secondaries.len(), 2);
@@ -148,7 +159,8 @@ async fn test_grant_lease_reuses_existing() {
     let m = make_master();
     m.create_file("/f".into()).await.unwrap();
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
-        .await.unwrap();
+        .await
+        .unwrap();
 
     let (_, p1, _, v1, bumped1, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
     assert!(bumped1);
@@ -171,7 +183,8 @@ async fn test_grant_lease_expired_regrants() {
     let m = Master::new(0, path.to_str().unwrap()).unwrap();
     m.create_file("/f".into()).await.unwrap();
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
-        .await.unwrap();
+        .await
+        .unwrap();
 
     // first grant: version 0 -> 1
     let (_, _, _, v1, _, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
@@ -200,7 +213,8 @@ async fn test_heartbeat_detects_stale_replica() {
     m.register_chunkserver("a:9000".into(), 1000).await;
     m.register_chunkserver("b:9000".into(), 1000).await;
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
-        .await.unwrap();
+        .await
+        .unwrap();
 
     // grant lease bumps version to 1
     let (_, _, _, version, _, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
@@ -227,9 +241,15 @@ async fn test_oplog_recovery() {
         let m = Master::new(60, path_str).unwrap();
         m.create_file("/a.txt".into()).await.unwrap();
         m.create_file("/b.txt".into()).await.unwrap();
-        m.add_chunk("/a.txt", vec!["cs1:9000".into()]).await.unwrap();
-        m.add_chunk("/a.txt", vec!["cs2:9000".into()]).await.unwrap();
-        m.add_chunk("/b.txt", vec!["cs1:9000".into()]).await.unwrap();
+        m.add_chunk("/a.txt", vec!["cs1:9000".into()])
+            .await
+            .unwrap();
+        m.add_chunk("/a.txt", vec!["cs2:9000".into()])
+            .await
+            .unwrap();
+        m.add_chunk("/b.txt", vec!["cs1:9000".into()])
+            .await
+            .unwrap();
 
         // grant lease bumps version on chunk 1
         m.register_chunkserver("cs1:9000".into(), 1000).await;
@@ -268,7 +288,10 @@ async fn test_oplog_recovery() {
 
     // new operations should still work and append to oplog
     recovered.create_file("/c.txt".into()).await.unwrap();
-    recovered.add_chunk("/c.txt", vec!["cs1:9000".into()]).await.unwrap();
+    recovered
+        .add_chunk("/c.txt", vec!["cs1:9000".into()])
+        .await
+        .unwrap();
     assert_eq!(recovered.get_file_chunks("/c.txt").await.unwrap(), vec![5]);
 }
 
@@ -295,7 +318,10 @@ async fn test_checkpoint_and_recovery() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // checkpoint should exist now
-        assert!(checkpoint_path.exists(), "checkpoint.bin should exist after 100 ops");
+        assert!(
+            checkpoint_path.exists(),
+            "checkpoint.bin should exist after 100 ops"
+        );
 
         // oplog.old.bin should be cleaned up by background task
         let _old_path = oplog_path.with_extension("old.bin");
@@ -309,7 +335,11 @@ async fn test_checkpoint_and_recovery() {
     for i in 0..50 {
         let name = format!("/file_{}.txt", i);
         let chunks = recovered.get_file_chunks(&name).await;
-        assert!(chunks.is_some(), "file {} should exist after checkpoint recovery", name);
+        assert!(
+            chunks.is_some(),
+            "file {} should exist after checkpoint recovery",
+            name
+        );
         assert_eq!(chunks.unwrap().len(), 1);
     }
 
@@ -318,8 +348,18 @@ async fn test_checkpoint_and_recovery() {
 
     // new ops still work after checkpoint recovery
     recovered.create_file("/post_cp.txt".into()).await.unwrap();
-    recovered.add_chunk("/post_cp.txt", vec!["cs:9000".into()]).await.unwrap();
-    assert_eq!(recovered.get_file_chunks("/post_cp.txt").await.unwrap().len(), 1);
+    recovered
+        .add_chunk("/post_cp.txt", vec!["cs:9000".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered
+            .get_file_chunks("/post_cp.txt")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -343,7 +383,9 @@ async fn test_checkpoint_with_post_checkpoint_ops() {
 
         // now do more ops AFTER checkpoint -- these go to the fresh oplog
         m.create_file("/new_after_cp.txt".into()).await.unwrap();
-        m.add_chunk("/new_after_cp.txt", vec!["cs:9000".into()]).await.unwrap();
+        m.add_chunk("/new_after_cp.txt", vec!["cs:9000".into()])
+            .await
+            .unwrap();
 
         // grant lease on chunk 1 to set a version
         m.register_chunkserver("cs:9000".into(), 1000).await;
@@ -361,7 +403,12 @@ async fn test_checkpoint_with_post_checkpoint_ops() {
     }
 
     // new file from post-checkpoint oplog
-    assert!(recovered.get_file_chunks("/new_after_cp.txt").await.is_some());
+    assert!(
+        recovered
+            .get_file_chunks("/new_after_cp.txt")
+            .await
+            .is_some()
+    );
 
     // version should be 1 from grant_lease in post-checkpoint oplog
     let chunks = recovered.chunks.read().await;
@@ -372,7 +419,9 @@ async fn test_checkpoint_with_post_checkpoint_ops() {
 async fn test_delete_file_lazy() {
     let m = make_master();
     m.create_file("/gc_me.txt".into()).await.unwrap();
-    m.add_chunk("/gc_me.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.add_chunk("/gc_me.txt", vec!["cs:9000".into()])
+        .await
+        .unwrap();
 
     // file exists before delete
     assert!(m.get_file_chunks("/gc_me.txt").await.is_some());
@@ -393,7 +442,9 @@ async fn test_delete_file_lazy() {
 async fn test_gc_sweep_before_retention() {
     let m = make_master();
     m.create_file("/gc_me.txt".into()).await.unwrap();
-    m.add_chunk("/gc_me.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.add_chunk("/gc_me.txt", vec!["cs:9000".into()])
+        .await
+        .unwrap();
     m.delete_file("/gc_me.txt".into()).await.unwrap();
 
     // sweep with 300s retention -- file was just deleted, should NOT be reaped
@@ -408,7 +459,11 @@ async fn test_gc_sweep_before_retention() {
 async fn test_gc_sweep_after_retention() {
     let m = make_master();
     m.create_file("/gc_me.txt".into()).await.unwrap();
-    let handle = m.add_chunk("/gc_me.txt", vec!["cs:9000".into()]).await.unwrap().unwrap();
+    let handle = m
+        .add_chunk("/gc_me.txt", vec!["cs:9000".into()])
+        .await
+        .unwrap()
+        .unwrap();
     m.delete_file("/gc_me.txt".into()).await.unwrap();
 
     // manually backdate the deletion timestamp so it looks expired
@@ -457,7 +512,9 @@ async fn test_crash_between_rotate_and_checkpoint() {
 
         // add post-checkpoint ops
         m.create_file("/after.txt".into()).await.unwrap();
-        m.add_chunk("/after.txt", vec!["cs:9000".into()]).await.unwrap();
+        m.add_chunk("/after.txt", vec!["cs:9000".into()])
+            .await
+            .unwrap();
     }
 
     // simulate crash before checkpoint finished: delete checkpoint, keep old log
@@ -485,9 +542,15 @@ async fn test_crash_between_rotate_and_checkpoint() {
 async fn test_snapshot_creates_copy() {
     let m = make_master();
     m.create_file("/src.txt".into()).await.unwrap();
-    m.add_chunk("/src.txt", vec!["cs:9000".into()]).await.unwrap();
+    m.add_chunk("/src.txt", vec!["cs:9000".into()])
+        .await
+        .unwrap();
 
-    assert!(m.snapshot("/src.txt".into(), "/snap.txt".into()).await.unwrap());
+    assert!(
+        m.snapshot("/src.txt".into(), "/snap.txt".into())
+            .await
+            .unwrap()
+    );
 
     // both files exist with the same chunk handles
     let src_chunks = m.get_file_chunks("/src.txt").await.unwrap();
@@ -511,7 +574,9 @@ async fn test_snapshot_revokes_leases() {
     m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
 
     // snapshot should revoke it
-    m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+    m.snapshot("/f.txt".into(), "/snap.txt".into())
+        .await
+        .unwrap();
 
     let chunks = m.chunks.read().await;
     assert!(chunks[&1].primary.is_none());
@@ -521,7 +586,11 @@ async fn test_snapshot_revokes_leases() {
 #[tokio::test]
 async fn test_snapshot_nonexistent_file() {
     let m = make_master();
-    assert!(!m.snapshot("/nope.txt".into(), "/snap.txt".into()).await.unwrap());
+    assert!(
+        !m.snapshot("/nope.txt".into(), "/snap.txt".into())
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -533,7 +602,9 @@ async fn test_cow_triggers_on_write_to_shared_chunk() {
     m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
 
     // snapshot: both files share chunk 1, ref_count = 2
-    m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+    m.snapshot("/f.txt".into(), "/snap.txt".into())
+        .await
+        .unwrap();
 
     // grant lease on shared chunk -COW should trigger
     let result = m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
@@ -574,7 +645,7 @@ async fn test_no_cow_without_snapshot() {
     let (actual_handle, _, _, _, _, cow_copy) = result;
 
     assert_eq!(actual_handle, 1); // same handle
-    assert!(cow_copy.is_none());  // no COW
+    assert!(cow_copy.is_none()); // no COW
 }
 
 #[tokio::test]
@@ -585,7 +656,9 @@ async fn test_cow_on_second_file() {
     m.register_chunkserver("cs:9000".into(), 1000).await;
     m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
 
-    m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+    m.snapshot("/f.txt".into(), "/snap.txt".into())
+        .await
+        .unwrap();
 
     // COW on /f.txt first
     let result1 = m.grant_lease(1, "/f.txt").await.unwrap().unwrap();
@@ -596,8 +669,8 @@ async fn test_cow_on_second_file() {
     let result2 = m.grant_lease(1, "/snap.txt").await.unwrap().unwrap();
     let (snap_handle, _, _, _, _, cow_copy) = result2;
 
-    assert_eq!(snap_handle, 1);   // no fork, same handle
-    assert!(cow_copy.is_none());  // no COW since ref_count is 1
+    assert_eq!(snap_handle, 1); // no fork, same handle
+    assert!(cow_copy.is_none()); // no COW since ref_count is 1
 
     // files diverged
     let f_chunks = m.get_file_chunks("/f.txt").await.unwrap();
@@ -616,7 +689,9 @@ async fn test_snapshot_survives_recovery() {
         let m = Master::new(60, path_str).unwrap();
         m.create_file("/f.txt".into()).await.unwrap();
         m.add_chunk("/f.txt", vec!["cs:9000".into()]).await.unwrap();
-        m.snapshot("/f.txt".into(), "/snap.txt".into()).await.unwrap();
+        m.snapshot("/f.txt".into(), "/snap.txt".into())
+            .await
+            .unwrap();
     }
 
     let recovered = Master::recover(60, path_str).await.unwrap();
@@ -629,4 +704,49 @@ async fn test_snapshot_survives_recovery() {
     // ref_count should be 2
     let chunks = recovered.chunks.read().await;
     assert_eq!(chunks[&f_chunks[0]].ref_count, 2);
+}
+
+// --- namespace locking tests ---
+
+#[tokio::test]
+async fn test_ns_concurrent_creates_different_files() {
+    let m = make_master();
+
+    // two creates on different files in same dir should both succeed
+    let (r1, r2) = tokio::join!(
+        m.create_file("/a.txt".into()),
+        m.create_file("/b.txt".into()),
+    );
+    r1.unwrap();
+    r2.unwrap();
+
+    assert!(m.get_file_chunks("/a.txt").await.is_some());
+    assert!(m.get_file_chunks("/b.txt").await.is_some());
+}
+
+#[tokio::test]
+async fn test_ns_read_during_different_file_mutation() {
+    let m = make_master();
+    m.create_file("/a.txt".into()).await.unwrap();
+
+    // reading /a.txt while creating /b.txt should not block
+    let (chunks, create_result) =
+        tokio::join!(m.get_file_chunks("/a.txt"), m.create_file("/b.txt".into()),);
+
+    assert!(chunks.is_some());
+    create_result.unwrap();
+}
+
+#[tokio::test]
+async fn test_ns_snapshot_blocks_same_dst_create() {
+    let m = make_master();
+    m.create_file("/src.txt".into()).await.unwrap();
+
+    // snapshot to /dst.txt then try creating /dst.txt - snapshot should win
+    m.snapshot("/src.txt".into(), "/dst.txt".into())
+        .await
+        .unwrap();
+
+    // /dst.txt already exists from snapshot
+    assert!(m.get_file_chunks("/dst.txt").await.is_some());
 }

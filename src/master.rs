@@ -4,6 +4,7 @@ use std::time::Instant;
 use std::{collections::HashMap, io, path::Path};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::namespace::NamespaceLock;
 use crate::oplog::{Checkpoint, OpLog, load_checkpoint, write_checkpoint};
 
 pub type ChunkHandle = u64;
@@ -37,6 +38,7 @@ pub struct Master {
     pub oplog: Mutex<OpLog>,
     oplog_path: String,
     checkpoint_path: String,
+    pub ns_lock: NamespaceLock,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -184,6 +186,7 @@ impl Master {
             oplog: Mutex::new(OpLog::new(Path::new(path_str))?),
             oplog_path: path_str.to_string(),
             checkpoint_path,
+            ns_lock: NamespaceLock::new(),
         })
     }
 
@@ -276,6 +279,7 @@ impl Master {
 
     ///creates a file entry in master metadata
     pub async fn create_file(&self, filename: String) -> io::Result<()> {
+        let _ns = self.ns_lock.lock_mutate(&filename).await;
         let mut oplog = self.oplog.lock().await;
         oplog.log(&OpLogEntry::CreateFile {
             filename: filename.clone(),
@@ -295,6 +299,7 @@ impl Master {
     /// the file's chunks are not removed yet -- a background GC scan will clean them up
     /// after the retention window expires.
     pub async fn delete_file(&self, filename: String) -> io::Result<bool> {
+        let _ns = self.ns_lock.lock_mutate(&filename).await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -331,6 +336,8 @@ impl Master {
     /// create a snapshot: clone the file entry, bump ref_counts, revoke leases.
     /// no data is copied -- COW handles that on first write.
     pub async fn snapshot(&self, src: String, dst: String) -> io::Result<bool> {
+        let _ns_src = self.ns_lock.lock_read(&src).await;
+        let _ns_dst = self.ns_lock.lock_mutate(&dst).await;
         let mut oplog = self.oplog.lock().await;
         oplog.log(&OpLogEntry::Snapshot {
             src: src.clone(),
@@ -369,6 +376,7 @@ impl Master {
         filename: &str,
         locations: Vec<String>,
     ) -> io::Result<Option<ChunkHandle>> {
+        let _ns = self.ns_lock.lock_mutate(filename).await;
         let handle = self.allocate_chunk_handle().await;
 
         let mut oplog = self.oplog.lock().await;
@@ -412,6 +420,7 @@ impl Master {
 
     ///get chunnkhandles associated with a given filename, used by clients to know which chunks to read/write for a file.
     pub async fn get_file_chunks(&self, filename: &str) -> Option<Vec<ChunkHandle>> {
+        let _ns = self.ns_lock.lock_read(filename).await;
         let files = self.files.read().await;
         files.get(filename).cloned()
     }
@@ -548,6 +557,7 @@ impl Master {
         handle: ChunkHandle,
         filename: &str,
     ) -> io::Result<Option<(ChunkHandle, String, Vec<String>, u64, bool, Option<(ChunkHandle, ChunkHandle, Vec<String>)>)>> {
+        let _ns = self.ns_lock.lock_mutate(filename).await;
         let (handle, cow_info) = self.cow_copy_if_needed(handle, filename).await?;
         let mut chunks = self.chunks.write().await;
         let info = match chunks.get_mut(&handle) {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 /// a held lock on a single path component - either read or write
 pub enum PathGuard {
@@ -12,7 +12,7 @@ pub enum PathGuard {
 /// allows concurrent operations on different files while serializing
 /// operations that conflict (e.g. create vs delete on same directory).
 pub struct NamespaceLock {
-    locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    locks: Mutex<HashMap<String, Arc<RwLock<()>>>>, //psth component -> lock
 }
 
 impl NamespaceLock {
