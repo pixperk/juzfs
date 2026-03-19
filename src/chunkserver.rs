@@ -277,6 +277,22 @@ impl ChunkServer {
         Ok(())
     }
 
+    /// COW snapshot: locally copy chunk data + checksums from src to dst handle
+    pub async fn copy_chunk(&self, src: ChunkHandle, dst: ChunkHandle) -> io::Result<()> {
+        fs::copy(self.chunk_path(src), self.chunk_path(dst))?;
+        fs::copy(self.checksum_path(src), self.checksum_path(dst))?;
+
+        // dst gets same version as src
+        let version = {
+            let stored = self.stored_chunks.read().await;
+            stored.get(&src).copied().unwrap_or(0)
+        };
+        self.write_version_to_disk(dst, version)?;
+        self.stored_chunks.write().await.insert(dst, version);
+
+        Ok(())
+    }
+
     /// returns (handle, version) for each stored chunk
     pub async fn list_chunks(&self) -> Vec<(ChunkHandle, u64)> {
         self.stored_chunks

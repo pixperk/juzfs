@@ -50,6 +50,12 @@ async fn handle_master_msg(cs: &ChunkServer, payload: &[u8]) {
                 }
             }
         }
+        MasterToChunkServer::CopyChunk { src, dst } => {
+            tracing::info!(src, dst, "cow: copying chunk locally");
+            if let Err(e) = cs.copy_chunk(src, dst).await {
+                tracing::error!(src, dst, error = %e, "failed to copy chunk");
+            }
+        }
         _ => {}
     }
 }

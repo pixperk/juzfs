@@ -95,11 +95,22 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                 }
             }
         }
-        ClientToMaster::GetPrimary { handle } => match master.grant_lease(handle).await {
-            Ok(Some((primary, secondaries, version, version_bumped))) => {
+        ClientToMaster::GetPrimary { handle, filename } => match master.grant_lease(handle, &filename).await {
+            Ok(Some((actual_handle, primary, secondaries, version, version_bumped, cow_copy))) => {
+                // if COW triggered, tell chunkservers to copy data locally
+                if let Some((src_handle, dst_handle, locations)) = cow_copy {
+                    tracing::info!(src = src_handle, dst = dst_handle, "cow: sending CopyChunk to chunkservers");
+                    for addr in &locations {
+                        if let Ok(mut conn) = TcpStream::connect(addr).await {
+                            let msg = MasterToChunkServer::CopyChunk { src: src_handle, dst: dst_handle };
+                            let _ = send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
+                        }
+                    }
+                }
+
                 if version_bumped {
                     tracing::info!(
-                        chunk = handle,
+                        chunk = actual_handle,
                         primary = %primary,
                         version = version,
                         secondaries = ?secondaries,
@@ -110,22 +121,23 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                         .collect();
                     for addr in &all_replicas {
                         if let Ok(mut conn) = TcpStream::connect(addr).await {
-                            let msg = MasterToChunkServer::UpdateVersion { handle, version };
+                            let msg = MasterToChunkServer::UpdateVersion { handle: actual_handle, version };
                             let _ =
                                 send_frame(&mut conn, MessageType::MasterToChunkServer, &msg).await;
                         } else {
-                            tracing::warn!(chunk = handle, replica = %addr, "failed to notify replica of version update");
+                            tracing::warn!(chunk = actual_handle, replica = %addr, "failed to notify replica of version update");
                         }
                     }
                 } else {
                     tracing::debug!(
-                        chunk = handle,
+                        chunk = actual_handle,
                         primary = %primary,
                         version = version,
                         "reusing existing lease"
                     );
                 }
                 MasterToClient::PrimaryInfo {
+                    handle: actual_handle,
                     primary,
                     secondaries,
                 }
@@ -149,6 +161,20 @@ async fn handle_client_msg(stream: &mut TcpStream, master: &Master, payload: &[u
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "oplog write failed on delete_file");
+                    MasterToClient::Error("internal error".into())
+                }
+            }
+        }
+        ClientToMaster::Snapshot { src, dst } => {
+            tracing::info!(src = %src, dst = %dst, "snapshot");
+            match master.snapshot(src, dst).await {
+                Ok(true) => MasterToClient::Ok,
+                Ok(false) => {
+                    tracing::warn!("snapshot failed, source file not found");
+                    MasterToClient::Error("source file not found".into())
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "oplog write failed on snapshot");
                     MasterToClient::Error("internal error".into())
                 }
             }

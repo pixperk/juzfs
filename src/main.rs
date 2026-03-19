@@ -60,6 +60,7 @@ async fn main() {
         "read" => cmd_read(&client, &args[1..], chunk_size).await,
         "append" => cmd_append(&client, &args[1..]).await,
         "stream" => cmd_stream(&client, &args[1..]).await,
+        "snapshot" => cmd_snapshot(&client, &args[1..]).await,
         _ => usage(),
     };
 
@@ -81,6 +82,14 @@ async fn cmd_delete(client: &Client, args: &[String]) -> std::io::Result<()> {
     let path = args.first().unwrap_or_else(|| usage());
     client.delete_file(path).await?;
     println!("deleted {}", path);
+    Ok(())
+}
+
+async fn cmd_snapshot(client: &Client, args: &[String]) -> std::io::Result<()> {
+    let src = args.first().unwrap_or_else(|| usage());
+    let dst = args.get(1).unwrap_or_else(|| usage());
+    client.snapshot(src, dst).await?;
+    println!("{} -> {}", src, dst);
     Ok(())
 }
 

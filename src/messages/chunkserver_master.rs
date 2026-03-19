@@ -30,4 +30,6 @@ pub enum MasterToChunkServer {
     DeleteChunks(Vec<ChunkHandle>),
     /// replication: copy this chunk to another chunkserver
     ReplicateChunk { handle: ChunkHandle, target: String },
+    /// COW snapshot: locally copy chunk data from src to dst handle
+    CopyChunk { src: ChunkHandle, dst: ChunkHandle },
 }

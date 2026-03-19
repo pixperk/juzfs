@@ -76,6 +76,29 @@ impl Client {
         }
     }
 
+    /// create a COW snapshot of a file
+    pub async fn snapshot(&self, src: &str, dst: &str) -> io::Result<()> {
+        let mut conn = TcpStream::connect(&self.master_addr).await?;
+        send_frame(
+            &mut conn,
+            MessageType::ClientToMaster,
+            &ClientToMaster::Snapshot {
+                src: src.to_string(),
+                dst: dst.to_string(),
+            },
+        )
+        .await?;
+        let (_, resp): (u8, MasterToClient) = read_frame(&mut conn).await?;
+        match resp {
+            MasterToClient::Ok => Ok(()),
+            MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected response",
+            )),
+        }
+    }
+
     /// ask master to allocate a new chunk for a file, returns (handle, locations)
     pub async fn allocate_chunk(&self, filename: &str) -> io::Result<(ChunkHandle, Vec<String>)> {
         let mut conn = TcpStream::connect(&self.master_addr).await?;
@@ -249,17 +272,23 @@ impl Client {
             data_offset += write_len;
 
             // ask master who the primary is (grants lease if needed)
-            let (primary, secondaries) = self.get_primary(handle).await?;
+            // actual_handle may differ from handle if COW triggered
+            let (actual_handle, primary, secondaries) = self.get_primary(handle, filename).await?;
+
+            // COW changed the handle — invalidate cached metadata
+            if actual_handle != handle {
+                self.invalidate_cache(filename).await;
+            }
 
             // build chain: primary first, then secondaries
             let mut chain = vec![primary.clone()];
             chain.extend(secondaries.clone());
 
             // phase 1: push data to all replicas via chain
-            self.push_data_chain(&chain, handle, chunk_data).await?;
+            self.push_data_chain(&chain, actual_handle, chunk_data).await?;
 
             // phase 2: tell primary to commit (primary coordinates secondaries)
-            self.commit_write(&primary, handle, secondaries).await?;
+            self.commit_write(&primary, actual_handle, secondaries).await?;
         }
 
         Ok(())
@@ -388,20 +417,21 @@ impl Client {
         }
     }
 
-    async fn get_primary(&self, handle: ChunkHandle) -> io::Result<(String, Vec<String>)> {
+    async fn get_primary(&self, handle: ChunkHandle, filename: &str) -> io::Result<(ChunkHandle, String, Vec<String>)> {
         let mut conn = TcpStream::connect(&self.master_addr).await?;
         send_frame(
             &mut conn,
             MessageType::ClientToMaster,
-            &ClientToMaster::GetPrimary { handle },
+            &ClientToMaster::GetPrimary { handle, filename: filename.to_string() },
         )
         .await?;
         let (_, resp): (u8, MasterToClient) = read_frame(&mut conn).await?;
         match resp {
             MasterToClient::PrimaryInfo {
+                handle: actual_handle,
                 primary,
                 secondaries,
-            } => Ok((primary, secondaries)),
+            } => Ok((actual_handle, primary, secondaries)),
             MasterToClient::Error(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -494,14 +524,18 @@ impl Client {
 
             // always append to the last chunk
             let (handle, _) = metadata[metadata.len() - 1];
-            let (primary, secondaries) = self.get_primary(handle).await?;
+            let (actual_handle, primary, secondaries) = self.get_primary(handle, filename).await?;
+
+            if actual_handle != handle {
+                self.invalidate_cache(filename).await;
+            }
 
             let mut conn = TcpStream::connect(&primary).await?;
             send_frame(
                 &mut conn,
                 MessageType::ClientToChunkServer,
                 &ClientToChunkServer::Append {
-                    handle,
+                    handle: actual_handle,
                     data: data.to_vec(),
                     secondaries,
                 },

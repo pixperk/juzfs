@@ -129,7 +129,7 @@ async fn test_grant_lease_new() {
     )
     .await.unwrap();
 
-    let (primary, secondaries, version, bumped) = m.grant_lease(1).await.unwrap().unwrap();
+    let (_h, primary, secondaries, version, bumped, _cow) = m.grant_lease(1, "/f").await.unwrap().unwrap();
 
     assert_eq!(primary, "a:9000");
     assert_eq!(secondaries.len(), 2);
@@ -150,12 +150,12 @@ async fn test_grant_lease_reuses_existing() {
     m.add_chunk("/f", vec!["a:9000".into(), "b:9000".into()])
         .await.unwrap();
 
-    let (p1, _, v1, bumped1) = m.grant_lease(1).await.unwrap().unwrap();
+    let (_, p1, _, v1, bumped1, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
     assert!(bumped1);
     assert_eq!(v1, 1);
 
     // second grant while lease is still active, no version bump
-    let (p2, _, v2, bumped2) = m.grant_lease(1).await.unwrap().unwrap();
+    let (_, p2, _, v2, bumped2, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
     assert_eq!(p1, p2);
     assert_eq!(v1, v2);
     assert!(!bumped2);
@@ -174,11 +174,11 @@ async fn test_grant_lease_expired_regrants() {
         .await.unwrap();
 
     // first grant: version 0 -> 1
-    let (_, _, v1, _) = m.grant_lease(1).await.unwrap().unwrap();
+    let (_, _, _, v1, _, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
     assert_eq!(v1, 1);
 
     // lease expired immediately, next grant bumps 1 -> 2
-    let (primary, _, v2, bumped) = m.grant_lease(1).await.unwrap().unwrap();
+    let (_, primary, _, v2, bumped, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
     assert_eq!(primary, "a:9000");
     assert_eq!(v2, 2);
     assert!(bumped);
@@ -190,7 +190,7 @@ async fn test_grant_lease_expired_regrants() {
 #[tokio::test]
 async fn test_grant_lease_nonexistent_chunk() {
     let m = make_master();
-    assert!(m.grant_lease(999).await.unwrap().is_none());
+    assert!(m.grant_lease(999, "/f").await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -203,7 +203,7 @@ async fn test_heartbeat_detects_stale_replica() {
         .await.unwrap();
 
     // grant lease bumps version to 1
-    let (_, _, version, _) = m.grant_lease(1).await.unwrap().unwrap();
+    let (_, _, _, version, _, _) = m.grant_lease(1, "/f").await.unwrap().unwrap();
     assert_eq!(version, 1);
 
     // "a" reports current version, "b" reports stale version
@@ -234,7 +234,7 @@ async fn test_oplog_recovery() {
         // grant lease bumps version on chunk 1
         m.register_chunkserver("cs1:9000".into(), 1000).await;
         m.heartbeat("cs1:9000", vec![(1, 0)], 1000).await;
-        m.grant_lease(1).await.unwrap().unwrap();
+        m.grant_lease(1, "/f").await.unwrap().unwrap();
         // master drops here, simulating a crash
     }
 
@@ -348,7 +348,7 @@ async fn test_checkpoint_with_post_checkpoint_ops() {
         // grant lease on chunk 1 to set a version
         m.register_chunkserver("cs:9000".into(), 1000).await;
         m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
-        m.grant_lease(1).await.unwrap().unwrap();
+        m.grant_lease(1, "/f").await.unwrap().unwrap();
     }
 
     // phase 2: recover -- should load checkpoint + replay fresh oplog

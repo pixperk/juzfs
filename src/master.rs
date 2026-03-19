@@ -58,6 +58,10 @@ pub enum OpLogEntry {
         hidden_name: String,
         timestamp: u64,
     },
+    Snapshot {
+        src: String,
+        dst: String,
+    },
 }
 
 impl Master {
@@ -247,6 +251,18 @@ impl Master {
                     .await
                     .insert(hidden_name, (filename, timestamp));
             }
+            OpLogEntry::Snapshot { src, dst } => {
+                let mut files = master.files.write().await;
+                if let Some(handles) = files.get(&src).cloned() {
+                    let mut chunks = master.chunks.write().await;
+                    for &h in &handles {
+                        if let Some(info) = chunks.get_mut(&h) {
+                            info.ref_count += 1;
+                        }
+                    }
+                    files.insert(dst, handles);
+                }
+            }
         }
     }
 
@@ -305,6 +321,41 @@ impl Master {
         let mut deleted = self.deleted_files.write().await;
         deleted.insert(hidden_name, (filename, now));
         drop(deleted);
+
+        if let Err(e) = self.maybe_checkpoint().await {
+            tracing::error!(error = %e, "checkpoint failed");
+        }
+        Ok(true)
+    }
+
+    /// create a snapshot: clone the file entry, bump ref_counts, revoke leases.
+    /// no data is copied -- COW handles that on first write.
+    pub async fn snapshot(&self, src: String, dst: String) -> io::Result<bool> {
+        let mut oplog = self.oplog.lock().await;
+        oplog.log(&OpLogEntry::Snapshot {
+            src: src.clone(),
+            dst: dst.clone(),
+        })?;
+        drop(oplog);
+
+        let mut files = self.files.write().await;
+        let handles = match files.get(&src).cloned() {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+        files.insert(dst, handles.clone());
+        drop(files);
+
+        // bump ref_counts and revoke leases on shared chunks
+        let mut chunks = self.chunks.write().await;
+        for &h in &handles {
+            if let Some(info) = chunks.get_mut(&h) {
+                info.ref_count += 1;
+                info.primary = None;
+                info.lease_expiry = None;
+            }
+        }
+        drop(chunks);
 
         if let Err(e) = self.maybe_checkpoint().await {
             tracing::error!(error = %e, "checkpoint failed");
@@ -432,13 +483,72 @@ impl Master {
     }
 
     /// grants lease to a chunkserver and returns (primary, secondaries, version, version_bumped).
+    /// if chunk is shared (ref_count > 1), do a COW copy: allocate new handle,
+    /// clone chunk info, swap handle in the file's chunk list.
+    /// returns the handle to actually grant the lease on.
+    /// returns (new_handle, Option<(old_handle, locations)>)
+    /// if COW triggered, the Option has the old handle + locations so caller can send CopyChunk
+    async fn cow_copy_if_needed(
+        &self,
+        handle: ChunkHandle,
+        filename: &str,
+    ) -> io::Result<(ChunkHandle, Option<(ChunkHandle, Vec<String>)>)> {
+        let mut chunks = self.chunks.write().await;
+        let info = match chunks.get(&handle) {
+            Some(i) => i,
+            None => return Ok((handle, None)),
+        };
+
+        if info.ref_count <= 1 {
+            return Ok((handle, None));
+        }
+
+        // allocate new handle
+        let mut next = self.next_chunk_handle.write().await;
+        let new_handle = *next;
+        *next += 1;
+        drop(next);
+
+        let locations = info.locations.clone();
+
+        // create new ChunkInfo cloned from old, with ref_count 1
+        let new_info = ChunkInfo {
+            handle: new_handle,
+            version: info.version,
+            primary: None,
+            lease_expiry: None,
+            locations: locations.clone(),
+            ref_count: 1,
+        };
+
+        // decrement old chunk's ref_count
+        chunks.get_mut(&handle).unwrap().ref_count -= 1;
+
+        chunks.insert(new_handle, new_info);
+        drop(chunks);
+
+        // swap handle in the file's chunk list
+        let mut files = self.files.write().await;
+        if let Some(handles) = files.get_mut(filename) {
+            if let Some(pos) = handles.iter().position(|&h| h == handle) {
+                handles[pos] = new_handle;
+            }
+        }
+
+        tracing::info!(old = handle, new = new_handle, file = filename, "cow: copied chunk metadata");
+
+        Ok((new_handle, Some((handle, locations))))
+    }
+
     /// version_bumped is true when a new lease was granted (version incremented),
     /// meaning the caller should notify all replicas to update their version.
     /// when reusing an existing lease, version_bumped is false.
     pub async fn grant_lease(
         &self,
         handle: ChunkHandle,
-    ) -> io::Result<Option<(String, Vec<String>, u64, bool)>> {
+        filename: &str,
+    ) -> io::Result<Option<(ChunkHandle, String, Vec<String>, u64, bool, Option<(ChunkHandle, ChunkHandle, Vec<String>)>)>> {
+        let (handle, cow_info) = self.cow_copy_if_needed(handle, filename).await?;
         let mut chunks = self.chunks.write().await;
         let info = match chunks.get_mut(&handle) {
             Some(i) => i,
@@ -454,7 +564,7 @@ impl Master {
                     .filter(|l| *l != primary)
                     .cloned()
                     .collect();
-                return Ok(Some((primary.clone(), secondaries, info.version, false)));
+                return Ok(Some((handle, primary.clone(), secondaries, info.version, false, None)));
             }
         }
 
@@ -485,10 +595,13 @@ impl Master {
         })?;
         drop(oplog);
 
+        // build cow copy info: (src_handle, dst_handle, locations)
+        let cow_copy = cow_info.map(|(old_handle, locs)| (old_handle, handle, locs));
+
         if let Err(e) = self.maybe_checkpoint().await {
             tracing::error!(error = %e, "checkpoint failed");
         }
-        Ok(Some((primary, secondaries, version, true)))
+        Ok(Some((handle, primary, secondaries, version, true, cow_copy)))
     }
 
     /// gfs-style checkpoint: rotate the oplog (fast, under lock), then write

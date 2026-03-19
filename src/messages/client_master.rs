@@ -15,9 +15,11 @@ pub enum ClientToMaster {
     /// ask master to allocate a new chunk for this file and pick replica locations
     AllocateChunk { filename: String },
     /// ask master who the primary is for a chunk (master grants lease if none active)
-    GetPrimary { handle: ChunkHandle },
+    GetPrimary { handle: ChunkHandle, filename: String },
     /// lazy delete a file (renames to hidden name, GC cleans up later)
     DeleteFile { filename: String },
+    /// COW snapshot: create an instant copy of a file
+    Snapshot { src: String, dst: String },
 }
 
 /// responses the master sends back to the client
@@ -33,7 +35,9 @@ pub enum MasterToClient {
         locations: Vec<String>,
     },
     /// primary + secondaries for a chunk (used by client to coordinate writes)
+    /// handle may differ from requested handle if COW triggered
     PrimaryInfo {
+        handle: ChunkHandle,
         primary: String,
         secondaries: Vec<String>,
     },
