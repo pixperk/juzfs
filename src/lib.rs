@@ -2,6 +2,7 @@ pub mod chunkserver;
 pub mod client;
 pub mod master;
 pub mod messages;
+pub mod namespace;
 pub mod oplog;
 pub mod protocol;
 
