@@ -215,14 +215,15 @@ Once removed, the stale chunkserver is invisible to clients. No reads or writes 
 
 The operation log (oplog) is how the master survives crashes. Every metadata mutation is written to an append-only log on disk before it is applied to memory. If the master crashes, it replays the log on startup and reconstructs its state.
 
-The oplog records four types of mutations:
+The oplog records five types of mutations:
 
 ```rust
 pub enum OpLogEntry {
     CreateFile { filename: String },
     AddChunk { filename: String, handle: ChunkHandle },
     GrantLease { handle: ChunkHandle, primary: String, version: u64 },
-    DeleteFile { filename: String, hidden_name: String },
+    DeleteFile { filename: String, hidden_name: String, timestamp: u64 },
+    Snapshot { src: String, dst: String },
 }
 ```
 
@@ -381,6 +382,178 @@ The chunkserver receives this and deletes the chunk files from disk. No separate
 
 This three-phase design means deletion never blocks the client, orphaned storage is reclaimed automatically, and a crash at any point is safe: the oplog and checkpoint preserve the `deleted_files` state, and the heartbeat cycle will eventually clean up chunkserver storage.
 
+## Copy-on-Write Snapshots
+
+Snapshots are the most intricate piece of the system. A snapshot creates an instant copy of a file with zero data copying. The actual copying is deferred until the first write to a shared chunk, following the GFS paper's copy-on-write approach.
+
+### Why Snapshots Are Hard
+
+A naive snapshot would copy every chunk of a file to new locations. For a 10GB file spread across 160 chunks, that's 30GB of network traffic (3x replication) and minutes of blocking. GFS avoids all of this by observing that most snapshots are never fully modified. If you snapshot a file and only edit the first chunk, why copy the other 159?
+
+### The Mechanism: Reference Counting
+
+Every chunk has a `ref_count`. It starts at 1 when the chunk is created. When a snapshot shares it, the count goes to 2. The ref_count is the only thing the system checks to decide whether a write needs to fork the chunk.
+
+```rust
+pub struct ChunkInfo {
+    pub handle: ChunkHandle,
+    pub version: u64,
+    pub primary: Option<String>,
+    pub lease_expiry: Option<Instant>,
+    pub locations: Vec<String>,
+    pub ref_count: u64,  // 1 = normal, >1 = shared by snapshot
+}
+```
+
+### Phase 1: Creating the Snapshot
+
+When the master receives a snapshot request for `/original.txt` -> `/copy.txt`:
+
+1. **Log to oplog** - `OpLogEntry::Snapshot { src, dst }` is flushed to disk before anything else
+2. **Revoke leases** - clear `primary` and `lease_expiry` on every chunk in the source file. This forces the next write to go through `grant_lease`, where the COW check happens
+3. **Duplicate metadata** - clone the source file's chunk handle list into the destination. Both files now point to the same physical chunks
+4. **Bump ref_counts** - increment `ref_count` on each shared chunk
+
+```rust
+pub async fn snapshot(&self, src: String, dst: String) -> io::Result<bool> {
+    oplog.log(&OpLogEntry::Snapshot { src: src.clone(), dst: dst.clone() })?;
+
+    let handles = files.get(&src).cloned();
+    files.insert(dst, handles.clone());
+
+    for &h in &handles {
+        if let Some(info) = chunks.get_mut(&h) {
+            info.ref_count += 1;       // 1 -> 2
+            info.primary = None;       // revoke lease
+            info.lease_expiry = None;
+        }
+    }
+    Ok(true)
+}
+```
+
+After this, the state looks like:
+
+```
+/original.txt -> [chunk 1, chunk 2]
+/copy.txt     -> [chunk 1, chunk 2]   (same handles, no data copied)
+
+chunk 1: ref_count = 2, primary = None
+chunk 2: ref_count = 2, primary = None
+```
+
+This is near-instantaneous regardless of file size. A 10GB file snapshots in microseconds.
+
+### Phase 2: Reading After Snapshot
+
+Reads don't need leases. Both files read from the same chunks, and both return identical data. There is no overhead for reads on snapshotted files.
+
+### Phase 3: First Write After Snapshot (COW)
+
+This is where the complexity lives. When a client writes to `/original.txt`, the system needs to fork the shared chunk so the snapshot isn't corrupted.
+
+The full sequence:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant M as Master
+    participant CS as ChunkServers
+
+    C->>M: GetPrimary(handle=1, "/original.txt")
+
+    Note over M: grant_lease calls cow_copy_if_needed
+    Note over M: ref_count(chunk 1) = 2, COW needed!
+    Note over M: allocate chunk 3 (ref_count=1)
+    Note over M: chunk 1: ref_count 2 -> 1
+    Note over M: /original.txt: [1,2] -> [3,2]
+    Note over M: /copy.txt: still [1,2]
+
+    M->>CS: CopyChunk(src=1, dst=3)
+    Note over CS: local disk copy, no network transfer
+
+    M->>CS: UpdateVersion(handle=3, version+1)
+    M->>C: PrimaryInfo(handle=3, primary, secondaries)
+
+    C->>CS: ForwardData(handle=3, data)
+    C->>CS: CommitWrite(handle=3)
+    CS-->>C: Ok
+```
+
+The `cow_copy_if_needed` function is the core:
+
+```rust
+async fn cow_copy_if_needed(&self, handle: ChunkHandle, filename: &str)
+    -> io::Result<(ChunkHandle, Option<(ChunkHandle, Vec<String>)>)>
+{
+    let info = chunks.get(&handle);
+    if info.ref_count <= 1 {
+        return Ok((handle, None));  // not shared, no COW
+    }
+
+    let new_handle = allocate_handle();
+
+    // clone metadata, ref_count = 1
+    chunks.insert(new_handle, ChunkInfo {
+        handle: new_handle,
+        version: info.version,
+        locations: info.locations.clone(),
+        ref_count: 1,
+        ..
+    });
+
+    // decrement old chunk
+    chunks.get_mut(&handle).ref_count -= 1;  // 2 -> 1
+
+    // swap in file's chunk list
+    // /original.txt: [1, 2] -> [3, 2]
+    files.get_mut(filename).swap(handle -> new_handle);
+
+    Ok((new_handle, Some((handle, locations))))
+}
+```
+
+The return value carries the old handle and locations so the caller can send `CopyChunk` to chunkservers. The chunkserver copies the data locally on disk, which is fast because it's a local file copy, not a network transfer. As the GFS paper notes: "disks are faster than 100 Mb Ethernet."
+
+### The Handle Propagation Problem
+
+After COW, the chunk handle changes from 1 to 3. This change must propagate correctly through the entire write path:
+
+- **Master -> ChunkServers**: `UpdateVersion` must use handle 3, not handle 1. If it uses 1, the chunkservers update the wrong chunk's version, and the next heartbeat reports handle 3 with a stale version, causing the master to drop its locations.
+- **Master -> Client**: `PrimaryInfo` includes the actual handle (3). The client needs this to send `ForwardData` and `CommitWrite` to the correct chunk.
+- **Client cache**: invalidated when the handle changes, so subsequent operations fetch fresh metadata from the master.
+
+`grant_lease` returns the actual handle in its tuple, and the master server uses it for all downstream operations:
+
+```rust
+// grant_lease shadows the input handle after COW
+let (handle, cow_info) = self.cow_copy_if_needed(handle, filename).await?;
+// from here, 'handle' is 3 (or unchanged if no COW)
+// version bump, oplog write, everything uses the correct handle
+Ok(Some((handle, primary, secondaries, version, true, cow_copy)))
+```
+
+### After the Write
+
+```
+/original.txt -> [chunk 3, chunk 2]   chunk 3 has new data
+/copy.txt     -> [chunk 1, chunk 2]   chunk 1 still has original data
+
+chunk 1: ref_count = 1 (only /copy.txt uses it now)
+chunk 2: ref_count = 2 (still shared, no write happened to it)
+chunk 3: ref_count = 1 (fresh, belongs to /original.txt)
+```
+
+If `/copy.txt` later writes to chunk 2, another COW fork happens. Each file diverges independently, only at the chunks that are actually modified.
+
+### Recovery
+
+Snapshots survive crashes through the oplog and checkpoint:
+
+- `OpLogEntry::Snapshot { src, dst }` is replayed on recovery, re-creating the file entry and bumping ref_counts
+- The `Checkpoint` struct includes `ref_count` in chunk metadata (via `#[serde(default)]` for backward compatibility)
+- After recovery, the COW mechanism works identically since it only depends on `ref_count`
+
 ## Data Integrity
 
 ![Consistency Model](https://www.pixperk.tech/assets/blog/gfs-3.png)
@@ -431,6 +604,8 @@ cargo run --bin juzfs -- read /hello.txt
 cargo run --bin juzfs -- read /hello.txt 4 5
 cargo run --bin juzfs -- append /hello.txt "another line"
 cargo run --bin juzfs -- stream /hello.txt
+cargo run --bin juzfs -- delete /hello.txt
+cargo run --bin juzfs -- snapshot /hello.txt /backup.txt
 ```
 
 ### CLI
@@ -449,6 +624,7 @@ commands:
   append <path> <data>         record append
   stream <path>                streaming read
   delete <path>                lazy delete (GC reclaims later)
+  snapshot <src> <dst>         COW snapshot (instant copy)
 ```
 
 ### Chunkserver
@@ -488,15 +664,16 @@ RUST_LOG=debug cargo run --bin master-server   # adds: heartbeats, cache behavio
 - Client metadata caching (30s staleness window)
 - Streaming reads with 4-chunk async buffer
 - Chunkserver recovery on restart (scans chunks, checksums, versions from disk)
-- CLI client with create, write, read, append, stream, delete commands
+- CLI client with create, write, read, append, stream, delete, snapshot commands
 - Garbage collection: lazy deletion, background sweep with configurable retention, heartbeat-driven chunk cleanup
+- Copy-on-write snapshots with reference counting, lease revocation, and handle propagation
 
 ## Remaining
 
+- Namespace locking for concurrent operations
 - Re-replication for under-replicated chunks
 - Chunk rebalancing across chunkservers
-- Copy-on-write snapshots
-- Namespace locking for concurrent operations
+- Shadow/backup master for read-only failover
 
 ## References
 
