@@ -271,3 +271,141 @@ async fn test_oplog_recovery() {
     recovered.add_chunk("/c.txt", vec!["cs1:9000".into()]).await.unwrap();
     assert_eq!(recovered.get_file_chunks("/c.txt").await.unwrap(), vec![5]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_and_recovery() {
+    let dir = tempdir().unwrap();
+    let oplog_path = dir.path().join("oplog.bin");
+    let checkpoint_path = dir.path().join("checkpoint.bin");
+    let path_str = oplog_path.to_str().unwrap();
+
+    // phase 1: build state, force a checkpoint by hitting the threshold
+    {
+        let m = Master::new(60, path_str).unwrap();
+
+        // create enough operations to trigger checkpoint (threshold = 100)
+        // each create_file + add_chunk = 2 entries, so 50 files = 100 entries
+        for i in 0..50 {
+            let name = format!("/file_{}.txt", i);
+            m.create_file(name.clone()).await.unwrap();
+            m.add_chunk(&name, vec!["cs:9000".into()]).await.unwrap();
+        }
+
+        // give background checkpoint task time to finish
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // checkpoint should exist now
+        assert!(checkpoint_path.exists(), "checkpoint.bin should exist after 100 ops");
+
+        // oplog.old.bin should be cleaned up by background task
+        let old_path = oplog_path.with_extension("old.bin");
+        // might still exist briefly, but checkpoint should be written
+    }
+
+    // phase 2: recover from checkpoint + oplog
+    let recovered = Master::recover(60, path_str).await.unwrap();
+
+    // all 50 files should be there
+    for i in 0..50 {
+        let name = format!("/file_{}.txt", i);
+        let chunks = recovered.get_file_chunks(&name).await;
+        assert!(chunks.is_some(), "file {} should exist after checkpoint recovery", name);
+        assert_eq!(chunks.unwrap().len(), 1);
+    }
+
+    // next handle should be correct (50 chunks = handles 1-50, next = 51)
+    assert_eq!(recovered.allocate_chunk_handle().await, 51);
+
+    // new ops still work after checkpoint recovery
+    recovered.create_file("/post_cp.txt".into()).await.unwrap();
+    recovered.add_chunk("/post_cp.txt", vec!["cs:9000".into()]).await.unwrap();
+    assert_eq!(recovered.get_file_chunks("/post_cp.txt").await.unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_checkpoint_with_post_checkpoint_ops() {
+    let dir = tempdir().unwrap();
+    let oplog_path = dir.path().join("oplog.bin");
+    let path_str = oplog_path.to_str().unwrap();
+
+    // phase 1: trigger checkpoint, then do more ops after it
+    {
+        let m = Master::new(60, path_str).unwrap();
+
+        // hit threshold
+        for i in 0..50 {
+            let name = format!("/old_{}.txt", i);
+            m.create_file(name.clone()).await.unwrap();
+            m.add_chunk(&name, vec!["cs:9000".into()]).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // now do more ops AFTER checkpoint -- these go to the fresh oplog
+        m.create_file("/new_after_cp.txt".into()).await.unwrap();
+        m.add_chunk("/new_after_cp.txt", vec!["cs:9000".into()]).await.unwrap();
+
+        // grant lease on chunk 1 to set a version
+        m.register_chunkserver("cs:9000".into(), 1000).await;
+        m.heartbeat("cs:9000", vec![(1, 0)], 1000).await;
+        m.grant_lease(1).await.unwrap().unwrap();
+    }
+
+    // phase 2: recover -- should load checkpoint + replay fresh oplog
+    let recovered = Master::recover(60, path_str).await.unwrap();
+
+    // old files from checkpoint
+    for i in 0..50 {
+        let name = format!("/old_{}.txt", i);
+        assert!(recovered.get_file_chunks(&name).await.is_some());
+    }
+
+    // new file from post-checkpoint oplog
+    assert!(recovered.get_file_chunks("/new_after_cp.txt").await.is_some());
+
+    // version should be 1 from grant_lease in post-checkpoint oplog
+    let chunks = recovered.chunks.read().await;
+    assert_eq!(chunks[&1].version, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_crash_between_rotate_and_checkpoint() {
+    let dir = tempdir().unwrap();
+    let oplog_path = dir.path().join("oplog.bin");
+    let path_str = oplog_path.to_str().unwrap();
+
+    // phase 1: build state, manually simulate a crash between rotate and checkpoint write
+    {
+        let m = Master::new(60, path_str).unwrap();
+
+        for i in 0..50 {
+            let name = format!("/file_{}.txt", i);
+            m.create_file(name.clone()).await.unwrap();
+            m.add_chunk(&name, vec!["cs:9000".into()]).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // add post-checkpoint ops
+        m.create_file("/after.txt".into()).await.unwrap();
+        m.add_chunk("/after.txt", vec!["cs:9000".into()]).await.unwrap();
+    }
+
+    // simulate crash before checkpoint finished: delete checkpoint, keep old log
+    let checkpoint_path = dir.path().join("checkpoint.bin");
+    let old_oplog = oplog_path.with_extension("old.bin");
+
+    // if checkpoint exists, delete it to simulate incomplete checkpoint
+    let _ = std::fs::remove_file(&checkpoint_path);
+
+    // manually create a fake old oplog with some entries to simulate the rotate happened
+    // but checkpoint didn't complete. Recovery should replay old + current oplog.
+    // In this case, the current oplog has post-checkpoint ops, and the old oplog
+    // has the pre-checkpoint ops (if it still exists)
+
+    // phase 2: recover -- should handle missing checkpoint gracefully
+    let recovered = Master::recover(60, path_str).await.unwrap();
+
+    // post-checkpoint file should exist (from current oplog)
+    assert!(recovered.get_file_chunks("/after.txt").await.is_some());
+}

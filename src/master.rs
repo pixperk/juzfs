@@ -4,7 +4,7 @@ use std::time::Instant;
 use std::{collections::HashMap, io, path::Path};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::oplog::OpLog;
+use crate::oplog::{Checkpoint, OpLog, load_checkpoint, write_checkpoint};
 
 pub type ChunkHandle = u64;
 
@@ -23,13 +23,17 @@ pub struct ChunkServerState {
     pub available_space: u64,
 }
 
+const CHECKPOINT_THRESHOLD: u64 = 100;
+
 pub struct Master {
     pub files: Arc<RwLock<HashMap<String, Vec<ChunkHandle>>>>,
     pub chunks: Arc<RwLock<HashMap<ChunkHandle, ChunkInfo>>>,
     pub chunkservers: Arc<RwLock<HashMap<String, ChunkServerState>>>,
     pub next_chunk_handle: Arc<RwLock<ChunkHandle>>,
-    pub expiry: time::Duration, // lease expiry duration
-    pub oplog: Mutex<OpLog>,    // operation log for durability and recovery
+    pub expiry: time::Duration,
+    pub oplog: Mutex<OpLog>,
+    oplog_path: String,
+    checkpoint_path: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -52,54 +56,87 @@ impl Master {
     /// recover master state from an existing oplog, then reopen it for appending.
     /// locations and leases are not restored -- chunkservers repopulate via heartbeat.
     pub async fn recover(expiry_in_seconds: u64, path_str: &str) -> io::Result<Self> {
-        let entries = match OpLog::replay(Path::new(path_str)) {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                tracing::info!("no oplog found, starting fresh");
-                Vec::new()
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "oplog replay failed, starting fresh");
-                Vec::new()
-            }
-        };
-
-        let entry_count = entries.len();
         let master = Master::new(expiry_in_seconds, path_str)?;
 
         let mut max_handle: ChunkHandle = 0;
         let mut files_recovered = 0u64;
         let mut chunks_recovered = 0u64;
 
-        for entry in entries {
-            match entry {
-                OpLogEntry::CreateFile { filename } => {
-                    master.files.write().await.insert(filename, Vec::new());
+        // step 1: load checkpoint if it exists
+        let checkpoint_path = Path::new(&master.checkpoint_path);
+        match load_checkpoint(checkpoint_path) {
+            Ok(cp) => {
+                for (filename, handles) in &cp.files {
+                    master
+                        .files
+                        .write()
+                        .await
+                        .insert(filename.clone(), handles.clone());
                     files_recovered += 1;
-                }
-                OpLogEntry::AddChunk { filename, handle } => {
-                    if let Some(chunks_list) = master.files.write().await.get_mut(&filename) {
-                        chunks_list.push(handle);
+                    for &h in handles {
+                        max_handle = max_handle.max(h);
+                        chunks_recovered += 1;
                     }
+                }
+                for (&handle, &version) in &cp.chunks {
                     master.chunks.write().await.insert(
                         handle,
                         ChunkInfo {
                             handle,
-                            version: 0,
+                            version,
                             primary: None,
                             lease_expiry: None,
                             locations: Vec::new(),
                         },
                     );
-                    max_handle = max_handle.max(handle);
-                    chunks_recovered += 1;
                 }
-                OpLogEntry::GrantLease { handle, version, .. } => {
-                    if let Some(info) = master.chunks.write().await.get_mut(&handle) {
-                        info.version = version;
-                    }
-                }
+                *master.next_chunk_handle.write().await = cp.next_chunk_handle;
+                max_handle = max_handle.max(cp.next_chunk_handle.saturating_sub(1));
+                tracing::info!(
+                    files = files_recovered,
+                    chunks = chunks_recovered,
+                    next_handle = cp.next_chunk_handle,
+                    "loaded checkpoint"
+                );
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                tracing::info!("no checkpoint found");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "checkpoint load failed, skipping");
+            }
+        }
+
+        // step 2: replay old oplog first (exists if crash happened between rotate and checkpoint)
+        let old_oplog_path = Path::new(path_str).with_extension("old.bin");
+        let old_entries = Self::load_oplog(&old_oplog_path);
+        let old_count = old_entries.len();
+        for entry in old_entries {
+            Self::apply_entry(
+                &master,
+                entry,
+                &mut max_handle,
+                &mut files_recovered,
+                &mut chunks_recovered,
+            )
+            .await;
+        }
+        if old_count > 0 {
+            tracing::info!(entries = old_count, "replayed old oplog");
+        }
+
+        // step 3: replay current oplog on top
+        let entries = Self::load_oplog(Path::new(path_str));
+        let entry_count = entries.len();
+        for entry in entries {
+            Self::apply_entry(
+                &master,
+                entry,
+                &mut max_handle,
+                &mut files_recovered,
+                &mut chunks_recovered,
+            )
+            .await;
         }
 
         if max_handle > 0 {
@@ -107,17 +144,22 @@ impl Master {
         }
 
         tracing::info!(
-            entries = entry_count,
+            oplog_entries = entry_count,
             files = files_recovered,
             chunks = chunks_recovered,
             next_handle = max_handle + 1,
-            "oplog recovery complete"
+            "recovery complete"
         );
 
         Ok(master)
     }
 
     pub fn new(expiry_in_seconds: u64, path_str: &str) -> io::Result<Self> {
+        let checkpoint_path = Path::new(path_str)
+            .with_file_name("checkpoint.bin")
+            .to_str()
+            .unwrap()
+            .to_string();
         Ok(Master {
             files: Arc::new(RwLock::new(HashMap::new())),
             chunks: Arc::new(RwLock::new(HashMap::new())),
@@ -125,7 +167,59 @@ impl Master {
             next_chunk_handle: Arc::new(RwLock::new(1)),
             expiry: time::Duration::from_secs(expiry_in_seconds),
             oplog: Mutex::new(OpLog::new(Path::new(path_str))?),
+            oplog_path: path_str.to_string(),
+            checkpoint_path,
         })
+    }
+
+    fn load_oplog(path: &Path) -> Vec<OpLogEntry> {
+        match OpLog::replay(path) {
+            Ok(entry) => entry,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "oplog replay failed");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn apply_entry(
+        master: &Master,
+        entry: OpLogEntry,
+        max_handle: &mut ChunkHandle,
+        files_recovered: &mut u64,
+        chunks_recovered: &mut u64,
+    ) {
+        match entry {
+            OpLogEntry::CreateFile { filename } => {
+                master.files.write().await.insert(filename, Vec::new());
+                *files_recovered += 1;
+            }
+            OpLogEntry::AddChunk { filename, handle } => {
+                if let Some(chunks_list) = master.files.write().await.get_mut(&filename) {
+                    chunks_list.push(handle);
+                }
+                master.chunks.write().await.insert(
+                    handle,
+                    ChunkInfo {
+                        handle,
+                        version: 0,
+                        primary: None,
+                        lease_expiry: None,
+                        locations: Vec::new(),
+                    },
+                );
+                *max_handle = (*max_handle).max(handle);
+                *chunks_recovered += 1;
+            }
+            OpLogEntry::GrantLease {
+                handle, version, ..
+            } => {
+                if let Some(info) = master.chunks.write().await.get_mut(&handle) {
+                    info.version = version;
+                }
+            }
+        }
     }
 
     ///allocates a new unique chunkhandle by incrementing a counter. this is used whenever a new chunk is created for a file.
@@ -139,20 +233,33 @@ impl Master {
     ///creates a file entry in master metadata
     pub async fn create_file(&self, filename: String) -> io::Result<()> {
         let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::CreateFile { filename: filename.clone() })?;
+        oplog.log(&OpLogEntry::CreateFile {
+            filename: filename.clone(),
+        })?;
         drop(oplog);
 
         let mut files = self.files.write().await;
         files.insert(filename, Vec::new());
+        drop(files);
+        if let Err(e) = self.maybe_checkpoint().await {
+            tracing::error!(error = %e, "checkpoint failed");
+        }
         Ok(())
     }
 
     ///allocates a new chunkhandle for a file and updates the master's metadata to reflect the new chunk and its locations. used when a client writes to a file and needs to create a new chunk.
-    pub async fn add_chunk(&self, filename: &str, locations: Vec<String>) -> io::Result<Option<ChunkHandle>> {
+    pub async fn add_chunk(
+        &self,
+        filename: &str,
+        locations: Vec<String>,
+    ) -> io::Result<Option<ChunkHandle>> {
         let handle = self.allocate_chunk_handle().await;
 
         let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::AddChunk { filename: filename.to_string(), handle })?;
+        oplog.log(&OpLogEntry::AddChunk {
+            filename: filename.to_string(),
+            handle,
+        })?;
         drop(oplog);
 
         let mut files = self.files.write().await;
@@ -172,7 +279,11 @@ impl Master {
 
         let mut chunks = self.chunks.write().await;
         chunks.insert(handle, info);
-
+        drop(chunks);
+        drop(files);
+        if let Err(e) = self.maybe_checkpoint().await {
+            tracing::error!(error = %e, "checkpoint failed");
+        }
         Ok(Some(handle))
     }
 
@@ -292,10 +403,65 @@ impl Master {
             .cloned()
             .collect();
 
+        drop(chunks);
+
         let mut oplog = self.oplog.lock().await;
-        oplog.log(&OpLogEntry::GrantLease { handle, primary: primary.clone(), version })?;
+        oplog.log(&OpLogEntry::GrantLease {
+            handle,
+            primary: primary.clone(),
+            version,
+        })?;
         drop(oplog);
 
+        if let Err(e) = self.maybe_checkpoint().await {
+            tracing::error!(error = %e, "checkpoint failed");
+        }
         Ok(Some((primary, secondaries, version, true)))
+    }
+
+    /// gfs-style checkpoint: rotate the oplog (fast, under lock), then write
+    /// checkpoint in background. new mutations continue to the fresh log immediately.
+    pub async fn maybe_checkpoint(&self) -> io::Result<()> {
+        let mut oplog = self.oplog.lock().await;
+        if oplog.count() < CHECKPOINT_THRESHOLD {
+            return Ok(());
+        }
+
+        // step 1: rotate log (fast -- just rename + open new file)
+        oplog.rotate(Path::new(&self.oplog_path))?;
+        tracing::info!("oplog rotated, starting background checkpoint");
+        drop(oplog); // release lock -- new mutations can proceed
+
+        // step 2: snapshot current state (reads don't block mutations)
+        let files = self.files.read().await.clone();
+        let chunks_map: HashMap<ChunkHandle, u64> = self
+            .chunks
+            .read()
+            .await
+            .iter()
+            .map(|(&h, info)| (h, info.version))
+            .collect();
+        let next_handle = *self.next_chunk_handle.read().await;
+
+        let cp = Checkpoint {
+            files,
+            chunks: chunks_map,
+            next_chunk_handle: next_handle,
+        };
+
+        // step 3: write checkpoint + delete old log in background (blocking I/O)
+        let checkpoint_path = self.checkpoint_path.clone();
+        let oplog_path = self.oplog_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = write_checkpoint(Path::new(&checkpoint_path), &cp) {
+                tracing::error!(error = %e, "background checkpoint write failed");
+                return;
+            }
+            let old_path = Path::new(&oplog_path).with_extension("old.bin");
+            let _ = std::fs::remove_file(&old_path);
+            tracing::info!("checkpoint written, old oplog deleted");
+        });
+
+        Ok(())
     }
 }
