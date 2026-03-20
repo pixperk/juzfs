@@ -986,7 +986,7 @@ Start the cluster in separate terminals:
 cargo run --bin master-server
 
 # shadow master (connects to primary :5001, serves reads on :5002)
-cargo run --bin shadow-server
+cargo run --bin shadow_server
 
 # three chunkservers (heartbeat to both primary and shadow)
 cargo run --bin chunkserver-node -- 127.0.0.1:6001 /tmp/cs1 127.0.0.1:5000 --shadow 127.0.0.1:5002
