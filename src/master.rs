@@ -760,6 +760,8 @@ impl Master {
                 under.push((*handle, info.locations.clone(), info.version));
             }
         }
+        // priority: fewer replicas first (1 replica before 2)
+        under.sort_by_key(|(_, locations, _)| locations.len());
         under
     }
 

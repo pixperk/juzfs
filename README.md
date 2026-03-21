@@ -1,6 +1,6 @@
 # juzfs
 
-A complete implementation of the [Google File System](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) in Rust. Raw TCP, no frameworks, no shortcuts. Built in 5 days on almost no sleep because once you start implementing a distributed file system, you can't really stop.
+A complete implementation of the [Google File System](https://static.googleusercontent.com/media/research.google.com/en//archive/gfs-sosp2003.pdf) in Rust. Raw TCP, no frameworks, no shortcuts.
 
 For a detailed breakdown of the GFS architecture, see [The Google File System: A Detailed Breakdown](https://www.pixperk.tech/blog/the-google-file-system-a-detailed-breakdown).
 
@@ -762,7 +762,7 @@ When a chunkserver dies or a disk fails, some chunks end up with fewer than 3 re
 
 ### Detection
 
-Every 30 seconds, the master scans its chunk metadata for chunks with fewer than `REPLICATION_FACTOR` (3) live locations. Chunks with zero locations are skipped -- there's no source to copy from (all replicas are lost).
+Every 30 seconds, the master scans its chunk metadata for chunks with fewer than `REPLICATION_FACTOR` (3) live locations. Chunks with zero locations are skipped -- there's no source to copy from (all replicas are lost). Results are sorted by priority: chunks with fewer replicas are healed first (1 replica before 2), matching the GFS paper's approach of prioritizing chunks furthest from the replication target.
 
 ```rust
 pub async fn detect_under_replicated(&self) -> Vec<(ChunkHandle, Vec<String>, u64)> {
@@ -772,6 +772,8 @@ pub async fn detect_under_replicated(&self) -> Vec<(ChunkHandle, Vec<String>, u6
             under.push((*handle, info.locations.clone(), info.version));
         }
     }
+    // priority: fewer replicas first (1 replica before 2)
+    under.sort_by_key(|(_, locations, _)| locations.len());
     under
 }
 ```
