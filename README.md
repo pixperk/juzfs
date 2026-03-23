@@ -611,20 +611,7 @@ Replication has two modes that work on the same connection:
 
 The shadow master replicates the primary's metadata state by tailing its operation log. Three subsystems make this work:
 
-```mermaid
-graph TD
-    P[Primary Master] -->|oplog broadcast| S1[Shadow Master 1]
-    P -->|oplog broadcast| S2[Shadow Master 2]
-    CS1[ChunkServer 1] -->|heartbeat| P
-    CS1 -->|heartbeat| S1
-    CS1 -->|heartbeat| S2
-    CS2[ChunkServer 2] -->|heartbeat| P
-    CS2 -->|heartbeat| S1
-    CS2 -->|heartbeat| S2
-    C[Client] -->|writes| P
-    C -.->|reads fallback| S1
-    C -.->|reads fallback| S2
-```
+![Shadow Master Architecture](https://raw.githubusercontent.com/pixperk/juzfs/main/assets/shadow-architecture.png)
 
 ### Oplog Broadcasting
 
@@ -870,26 +857,7 @@ On the next cycle (120s later), the master checks each pending move:
 - **Target hasn't reported it yet**: keep pending, check again next cycle.
 - **Chunk was deleted** (e.g. by GC): clear the pending entry, nothing to do.
 
-```mermaid
-sequenceDiagram
-    participant M as Master
-    participant S as Source CS (overloaded)
-    participant T as Target CS (underloaded)
-
-    Note over M: Phase 1 (cycle N)
-    Note over M: avg=3.3, threshold=4, cs1 has 6 chunks
-    M->>S: ReplicateChunk(handle=5, target="cs2")
-    Note over M: record pending: chunk 5, cs1 -> cs2
-    S->>T: ReplicateData(handle=5, data, version)
-    T-->>S: Ack::Ok
-
-    Note over M: Phase 2 (cycle N+1)
-    Note over T: heartbeat reports chunk 5
-    Note over M: confirm: cs2 has chunk 5
-    Note over M: remove cs1 from chunk 5 locations
-    M->>S: DeleteChunks([5])
-    Note over S: deletes chunk 5 from disk
-```
+![Chunk Rebalancing: Two-Phase Move](https://raw.githubusercontent.com/pixperk/juzfs/main/assets/chunk-rebalancing.png)
 
 ### Why Two Phases?
 
